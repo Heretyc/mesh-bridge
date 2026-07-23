@@ -147,6 +147,7 @@ export class IpcServer {
   }
 
   private authenticate(socket: Socket): void {
+    socket.on("error", () => this.clients.delete(socket));
     socket.setTimeout(5_000, () => socket.destroy());
     let input = "";
     const onData = (chunk: Buffer): void => {

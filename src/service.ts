@@ -56,6 +56,19 @@ function reason(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+async function disconnectRejectedProbe(transport: TransportNodeSerial): Promise<void> {
+  const onUnhandled = (error: unknown): void => {
+    if (!(error instanceof DOMException && error.name === "AbortError")) throw error;
+  };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    await transport.disconnect().catch(() => undefined);
+    await delay(0);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+}
+
 function abortPromise(signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     if (signal.aborted) resolve();
@@ -382,7 +395,7 @@ export class BridgeService {
       };
       return session;
     } catch (error) {
-      await transport.disconnect().catch(() => undefined);
+      await disconnectRejectedProbe(transport);
       if (/channel named|not encrypted|invalid index/i.test(reason(error))) throw new FatalConfigurationError(reason(error));
       throw error;
     }
