@@ -1,12 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { parseConfig } from "./config.js";
+import { PermissionFlagsBits } from "discord.js";
 import {
   BoundedQueue,
   MESHTASTIC_TEXT_BYTES,
+  ReplyCorrelator,
   TtlDedup,
+  TtlMap,
   discoverMeshtasticPath,
   formatMeshForDiscord,
+  hasRequiredDiscordPermissions,
+  replyIdForChunk,
   resolveDiscordMentions,
   resolveEncryptedChannel,
   retry,
@@ -176,6 +181,86 @@ test("ACK retry is bounded and observable with a mock sender", async () => {
     throw new Error("mock timeout");
   }, 1), /mock timeout/u);
   assert.equal(calls, 2);
+});
+
+test("TtlMap expires, refreshes on write, and evicts the oldest entry past capacity", () => {
+  const map = new TtlMap<string, number>(100, 2);
+  map.set("a", 1, 0);
+  assert.equal(map.get("a", 50), 1);
+  assert.equal(map.get("a", 100), undefined); // expiry is exclusive of the TTL boundary
+  assert.equal(map.size, 0);
+
+  map.set("b", 2, 0);
+  map.set("b", 3, 60); // rewriting refreshes both value and lifetime
+  assert.equal(map.get("b", 150), 3);
+  assert.equal(map.get("b", 161), undefined);
+
+  const bounded = new TtlMap<string, number>(1_000, 2);
+  bounded.set("x", 1, 0);
+  bounded.set("y", 2, 1);
+  bounded.set("z", 3, 2);
+  assert.equal(bounded.size, 2);
+  assert.equal(bounded.get("x", 3), undefined); // insertion-ordered eviction drops the oldest
+  assert.deepEqual([bounded.get("y", 3), bounded.get("z", 3)], [2, 3]);
+});
+
+test("first mesh chunk is the canonical reply root while every chunk maps back to the Discord message", () => {
+  const correlator = new ReplyCorrelator(new TtlMap<string, number>(1_000, 10), new TtlMap<number, string>(1_000, 10));
+  [111, 222, 333].forEach((meshId, index) => correlator.recordOutboundChunk("discord-1", index, meshId, 0));
+
+  assert.equal(correlator.meshRootFor("discord-1", 0), 111);
+  for (const meshId of [111, 222, 333]) assert.equal(correlator.discordTargetFor(meshId, 0), "discord-1");
+  assert.equal(correlator.discordTargetFor(0, 0), undefined); // mesh id 0 means unset
+  assert.equal(correlator.meshRootFor(undefined, 0), undefined);
+  assert.equal(correlator.meshRootFor("unknown", 0), undefined);
+
+  correlator.recordOutboundChunk("discord-2", 0, 0, 0); // an unACKed/zero id is never correlated
+  assert.equal(correlator.meshRootFor("discord-2", 0), undefined);
+
+  correlator.recordInbound(444, "discord-3", 0); // inbound mesh traffic correlates both directions
+  assert.equal(correlator.discordTargetFor(444, 0), "discord-3");
+  assert.equal(correlator.meshRootFor("discord-3", 0), 444);
+
+  assert.equal(correlator.meshRootFor("discord-1", 1_000), undefined); // correlation is TTL-bounded
+  assert.equal(correlator.discordTargetFor(111, 1_000), undefined);
+});
+
+test("native replyId is sent only on the first chunk and unmapped targets relay unthreaded", async () => {
+  const sent: Array<{ chunk: string; replyId: number | undefined }> = [];
+  const sender = async (chunk: string, replyId: number | undefined): Promise<number> => {
+    sent.push({ chunk, replyId });
+    return 900 + sent.length;
+  };
+
+  const correlator = new ReplyCorrelator(new TtlMap<string, number>(1_000, 10), new TtlMap<number, string>(1_000, 10));
+  correlator.recordInbound(555, "target-discord-id", 0);
+
+  const chunks = splitDiscordForMesh("Ada", "word ".repeat(120).trim());
+  assert.ok(chunks.length > 1);
+  const root = correlator.meshRootFor("target-discord-id", 0);
+  for (const [index, chunk] of chunks.entries()) {
+    const meshId = await sender(chunk, replyIdForChunk(index, root));
+    correlator.recordOutboundChunk("reply-discord-id", index, meshId, 0);
+  }
+
+  assert.equal(sent[0]!.replyId, 555);
+  assert.ok(sent.slice(1).every((entry) => entry.replyId === undefined));
+  assert.equal(correlator.meshRootFor("reply-discord-id", 0), 901);
+  assert.equal(correlator.discordTargetFor(902, 0), "reply-discord-id");
+
+  // An unknown/expired target yields no replyId at all, so the chunk is relayed unthreaded.
+  assert.equal(replyIdForChunk(0, correlator.meshRootFor("never-seen", 0)), undefined);
+});
+
+test("startup requires View Channel, Send Messages, and Read Message History", () => {
+  const granted = (...bits: bigint[]) => ({ has: (needed: bigint[]) => needed.every((bit) => bits.includes(bit)) });
+  const all = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory];
+
+  assert.equal(hasRequiredDiscordPermissions(granted(...all)), true);
+  assert.equal(hasRequiredDiscordPermissions(granted(PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages)), false);
+  assert.equal(hasRequiredDiscordPermissions(granted(PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory)), false);
+  assert.equal(hasRequiredDiscordPermissions(granted(PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory)), false);
+  assert.equal(hasRequiredDiscordPermissions(null), false);
 });
 
 test("TTL dedup and queue capacity are bounded", async () => {

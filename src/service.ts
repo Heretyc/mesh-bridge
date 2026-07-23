@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { pathToFileURL } from "node:url";
 import { Constants, MeshDevice, Protobuf, Types } from "@meshtastic/core";
 import { TransportNodeSerial } from "@meshtastic/transport-node-serial";
 import {
@@ -6,7 +7,6 @@ import {
   Events,
   GatewayIntentBits,
   MessageType,
-  PermissionFlagsBits,
   type Message,
   type SendableChannels,
 } from "discord.js";
@@ -14,11 +14,15 @@ import { SerialPort } from "serialport";
 import { loadEnvironment, parseConfig, unsafeEnvPermissions, type Config } from "./config.js";
 import {
   BoundedQueue,
+  ReplyCorrelator,
   TtlDedup,
+  TtlMap,
   backoff,
   delay,
   discoverMeshtasticPath,
   formatMeshForDiscord,
+  hasRequiredDiscordPermissions,
+  replyIdForChunk,
   resolveDiscordMentions,
   resolveEncryptedChannel,
   retry,
@@ -35,11 +39,15 @@ class FatalConfigurationError extends Error {}
 interface DiscordJob {
   id: string;
   chunks: string[];
+  /** Discord message this one natively replies to, resolved to a mesh root only at delivery time. */
+  replyToDiscordId: string | undefined;
 }
 
 interface MeshJob {
   from: number;
   text: string;
+  packetId: number;
+  replyId: number;
 }
 
 interface MeshSession {
@@ -85,6 +93,7 @@ export class BridgeService {
   private readonly meshToDiscord: BoundedQueue<MeshJob>;
   private readonly discordDedup: TtlDedup;
   private readonly meshDedup: TtlDedup;
+  private readonly replies: ReplyCorrelator;
   private nodeNames = new Map<number, string>();
   private discord: Client | undefined;
   private discordChannel: SendableChannels | undefined;
@@ -95,6 +104,10 @@ export class BridgeService {
     this.ipc = new IpcServer(config.ipcPort, config.ipcToken, this.status);
     this.discordDedup = new TtlDedup(config.dedupTtlMs, config.queueLimit * 10);
     this.meshDedup = new TtlDedup(config.dedupTtlMs, config.queueLimit * 10);
+    this.replies = new ReplyCorrelator(
+      new TtlMap<string, number>(config.dedupTtlMs, config.queueLimit * 10),
+      new TtlMap<number, string>(config.dedupTtlMs, config.queueLimit * 10),
+    );
     this.discordToMesh = new BoundedQueue(config.queueLimit, (depth) => this.status.queue("discordToMesh", depth));
     this.meshToDiscord = new BoundedQueue(config.queueLimit, (depth) => this.status.queue("meshToDiscord", depth));
   }
@@ -160,9 +173,8 @@ export class BridgeService {
         if (!channel || !channel.isSendable() || channel.isDMBased()) {
           throw new FatalConfigurationError("DISCORD_CHANNEL_ID is not a sendable server channel visible to Mesh Bridge");
         }
-        const permissions = channel.permissionsFor(client.user);
-        if (!permissions?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages])) {
-          throw new FatalConfigurationError("Mesh Bridge needs only View Channel and Send Messages in DISCORD_CHANNEL_ID");
+        if (!hasRequiredDiscordPermissions(channel.permissionsFor(client.user))) {
+          throw new FatalConfigurationError("Mesh Bridge needs only View Channel, Send Messages, and Read Message History in DISCORD_CHANNEL_ID");
         }
         this.discord = client;
         this.discordChannel = channel;
@@ -223,7 +235,11 @@ export class BridgeService {
 
     this.status.count("discordReceived");
     const displayName = message.member?.displayName ?? message.author.globalName ?? message.author.username;
-    const job = { id: message.id, chunks: splitDiscordForMesh(displayName, body) };
+    const job: DiscordJob = {
+      id: message.id,
+      chunks: splitDiscordForMesh(displayName, body),
+      replyToDiscordId: message.reference?.messageId,
+    };
     if (!this.discordToMesh.enqueue(job)) {
       this.status.count("rejected");
       this.status.event("error", "DISCORD_TO_MESH_QUEUE_FULL", { discordId: message.id });
@@ -232,21 +248,29 @@ export class BridgeService {
   }
 
   private async deliverDiscordToMesh(job: DiscordJob): Promise<void> {
+    // Resolved at delivery time so FIFO ordering decides whether the target has been correlated yet.
+    const meshRoot = this.replies.meshRootFor(job.replyToDiscordId);
+    if (job.replyToDiscordId !== undefined && meshRoot === undefined) {
+      this.status.event("warn", "REPLY_TARGET_UNAVAILABLE", { direction: "discordToMesh", referencedId: job.replyToDiscordId });
+    }
     let delivered = 0;
-    for (const chunk of job.chunks) {
+    // The loop index, not the delivered count, decides the reply root: chunk 1 is the only chunk that quotes it.
+    for (const [index, chunk] of job.chunks.entries()) {
       try {
-        await retry(async () => {
+        const packetId = await retry(async () => {
           const session = await this.waitForMesh();
           await this.waitForMeshSendSlot();
-          await Promise.race([
-            session.device.sendText(chunk, "broadcast", true, session.channel as Types.ChannelNumber),
-            session.disconnected.then(() => Promise.reject(new Error("Meshtastic disconnected before ACK"))),
-            delay(65_000, this.abort.signal).then(() => Promise.reject(new Error("Meshtastic ACK timeout"))),
+          return Promise.race([
+            session.device.sendText(chunk, "broadcast", true, session.channel as Types.ChannelNumber, replyIdForChunk(index, meshRoot)),
+            session.disconnected.then<never>(() => Promise.reject(new Error("Meshtastic disconnected before ACK"))),
+            delay(65_000, this.abort.signal).then<never>(() => Promise.reject(new Error("Meshtastic ACK timeout"))),
           ]);
         }, this.config.ackRetries, () => {
           this.status.count("retries");
-          this.status.event("warn", "MESH_SEND_RETRY", { discordId: job.id, chunk: delivered + 1 });
+          this.status.event("warn", "MESH_SEND_RETRY", { discordId: job.id, chunk: index + 1 });
         });
+        // Every chunk maps back to the Discord message; only chunk 1 becomes that message's canonical mesh root.
+        this.replies.recordOutboundChunk(job.id, index, packetId);
         delivered += 1;
         this.status.count("meshSent");
       } catch (error) {
@@ -432,7 +456,7 @@ export class BridgeService {
       return;
     }
     this.status.count("meshReceived");
-    if (!this.meshToDiscord.enqueue({ from: packet.from, text })) {
+    if (!this.meshToDiscord.enqueue({ from: packet.from, text, packetId: packet.id, replyId: data.replyId })) {
       this.status.count("rejected");
       this.status.event("error", "MESH_TO_DISCORD_QUEUE_FULL", { from: packet.from, packetId: packet.id });
     }
@@ -441,8 +465,21 @@ export class BridgeService {
   private async deliverMeshToDiscord(job: MeshJob): Promise<void> {
     const channel = await this.waitForDiscord();
     const name = this.nodeNames.get(job.from) ?? `Unknown !${job.from.toString(16).padStart(8, "0")}`;
+    const target = this.replies.discordTargetFor(job.replyId);
+    if (job.replyId !== 0 && target === undefined) {
+      this.status.event("warn", "REPLY_TARGET_UNAVAILABLE", { direction: "meshToDiscord", referencedId: job.replyId });
+    }
     try {
-      await channel.send({ content: formatMeshForDiscord(name, job.text), allowedMentions });
+      const sent = await channel.send({
+        content: formatMeshForDiscord(name, job.text),
+        allowedMentions,
+        ...(target === undefined ? {} : { reply: { messageReference: target, failIfNotExists: false } }),
+      });
+      // failIfNotExists silently drops the reference when the target is gone; surface that as unthreaded.
+      if (target !== undefined && sent.reference?.messageId !== target) {
+        this.status.event("warn", "REPLY_TARGET_UNAVAILABLE", { direction: "meshToDiscord", referencedId: job.replyId });
+      }
+      this.replies.recordInbound(job.packetId, sent.id);
       this.status.count("discordSent");
     } catch (error) {
       if (this.abort.signal.aborted) return;
@@ -496,4 +533,5 @@ async function main(): Promise<void> {
   }
 }
 
-void main();
+// Only `node dist/service.js` runs the bridge; importing this module must not open the radio or Discord.
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) void main();

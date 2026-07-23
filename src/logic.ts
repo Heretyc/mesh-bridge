@@ -1,4 +1,4 @@
-import { escapeMarkdown } from "discord.js";
+import { PermissionFlagsBits, escapeMarkdown } from "discord.js";
 
 // Firmware adds the encoded Data port and bitfield to text before enforcing the 239-byte encrypted envelope.
 export const MESHTASTIC_TEXT_BYTES = 232;
@@ -37,6 +37,17 @@ export function resolveEncryptedChannel(channels: MeshChannelCandidate[], config
     throw new Error(`Meshtastic channel "${configuredName}" is not encrypted`);
   }
   return channel.index;
+}
+
+// Native replies need history access as well as the two forwarding permissions.
+export const REQUIRED_DISCORD_PERMISSIONS: readonly bigint[] = [
+  PermissionFlagsBits.ViewChannel,
+  PermissionFlagsBits.SendMessages,
+  PermissionFlagsBits.ReadMessageHistory,
+];
+
+export function hasRequiredDiscordPermissions(permissions: { has(bits: bigint[]): boolean } | null | undefined): boolean {
+  return permissions?.has([...REQUIRED_DISCORD_PERMISSIONS]) === true;
 }
 
 export function shouldForwardDiscord(input: DiscordRouteInput, configuredChannelId: string): boolean {
@@ -185,6 +196,73 @@ export class TtlDedup {
     }
     return false;
   }
+}
+
+/** Insertion-ordered, TTL-bounded, capacity-bounded map. Writing a key refreshes both its lifetime and its position. */
+export class TtlMap<K, V> {
+  private readonly entries = new Map<K, { value: V; at: number }>();
+  public constructor(private readonly ttlMs: number, private readonly limit: number) {}
+
+  public set(key: K, value: V, now = Date.now()): void {
+    this.entries.delete(key);
+    this.entries.set(key, { value, at: now });
+    for (const [candidate, entry] of this.entries) {
+      if (now - entry.at >= this.ttlMs || this.entries.size > this.limit) this.entries.delete(candidate);
+      else break;
+    }
+  }
+
+  public get(key: K, now = Date.now()): V | undefined {
+    const entry = this.entries.get(key);
+    if (entry === undefined) return undefined;
+    if (now - entry.at >= this.ttlMs) {
+      this.entries.delete(key);
+      return undefined;
+    }
+    return entry.value;
+  }
+
+  public get size(): number {
+    return this.entries.size;
+  }
+}
+
+/**
+ * Bidirectional reply correlation. The first mesh chunk of a Discord message is the canonical reply root,
+ * while every chunk maps back to that Discord message so a mesh reply to any chunk threads correctly.
+ */
+export class ReplyCorrelator {
+  public constructor(
+    private readonly meshRootByDiscordId: TtlMap<string, number>,
+    private readonly discordIdByMeshId: TtlMap<number, string>,
+  ) {}
+
+  /** Mesh packet id to quote when relaying a Discord reply, or undefined when the target is unknown or expired. */
+  public meshRootFor(discordId: string | undefined, now?: number): number | undefined {
+    return discordId === undefined ? undefined : this.meshRootByDiscordId.get(discordId, now);
+  }
+
+  /** Discord message id to reply to when relaying a mesh reply, or undefined when the target is unknown or expired. */
+  public discordTargetFor(replyId: number, now?: number): string | undefined {
+    return replyId === 0 ? undefined : this.discordIdByMeshId.get(replyId, now);
+  }
+
+  public recordOutboundChunk(discordId: string, chunkIndex: number, meshPacketId: number, now?: number): void {
+    if (meshPacketId === 0) return; // Mesh id 0 means "unset" and must never be correlated.
+    this.discordIdByMeshId.set(meshPacketId, discordId, now);
+    if (chunkIndex === 0) this.meshRootByDiscordId.set(discordId, meshPacketId, now);
+  }
+
+  public recordInbound(meshPacketId: number, discordId: string, now?: number): void {
+    if (meshPacketId === 0) return;
+    this.discordIdByMeshId.set(meshPacketId, discordId, now);
+    this.meshRootByDiscordId.set(discordId, meshPacketId, now);
+  }
+}
+
+/** Only the first chunk carries the native reply; continuations are plain sends. */
+export function replyIdForChunk(chunkIndex: number, meshRootId: number | undefined): number | undefined {
+  return chunkIndex === 0 ? meshRootId : undefined;
 }
 
 export class BoundedQueue<T> {
