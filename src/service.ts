@@ -17,6 +17,7 @@ import {
   TtlDedup,
   backoff,
   delay,
+  discoverMeshtasticPath,
   resolveEncryptedChannel,
   retry,
   safeAttachmentName,
@@ -44,6 +45,7 @@ interface MeshSession {
   channel: number;
   localNode: number;
   disconnected: Promise<void>;
+  activate: () => void;
   close: () => Promise<void>;
 }
 
@@ -68,7 +70,7 @@ export class BridgeService {
   private readonly meshToDiscord: BoundedQueue<MeshJob>;
   private readonly discordDedup: TtlDedup;
   private readonly meshDedup: TtlDedup;
-  private readonly nodeNames = new Map<number, string>();
+  private nodeNames = new Map<number, string>();
   private discord: Client | undefined;
   private discordChannel: SendableChannels | undefined;
   private mesh: MeshSession | undefined;
@@ -278,35 +280,57 @@ export class BridgeService {
   private async openMesh(): Promise<MeshSession> {
     const ports = await SerialPort.list();
     const candidates = ports.filter((port) => Boolean(port.vendorId) || /^USB/i.test(port.pnpId ?? ""));
-    if (candidates.length !== 1) {
-      const paths = candidates.map((port) => port.path);
-      throw new Error(candidates.length === 0
-        ? "No USB serial device found; connect exactly one Meshtastic device"
-        : `Multiple USB serial devices found (${paths.join(", ")}); leave exactly one Meshtastic device connected`);
+    const sessions = new Map<string, MeshSession>();
+    try {
+      const serialPath = await discoverMeshtasticPath(candidates.map((port) => port.path), async (path) => {
+        try {
+          sessions.set(path, await this.openMeshAt(path));
+          return true;
+        } catch (error) {
+          if (error instanceof FatalConfigurationError) throw error;
+          this.status.event("warn", "SERIAL_PROBE_REJECTED", { serialPort: path, reason: reason(error) });
+          return false;
+        }
+      });
+      const session = sessions.get(serialPath)!;
+      session.activate();
+      return session;
+    } catch (error) {
+      await Promise.allSettled([...sessions.values()].map((session) => session.close()));
+      throw error;
     }
+  }
 
-    const serialPath = candidates[0]!.path;
-    this.status.connection({ serialPort: serialPath });
-    const transport = await TransportNodeSerial.create(serialPath);
+  private async openMeshAt(serialPath: string): Promise<MeshSession> {
+    const port = new SerialPort({ path: serialPath, baudRate: 115_200, autoOpen: false });
+    await new Promise<void>((resolve, reject) => port.open((error) => error ? reject(error) : resolve()));
+    const transport = new TransportNodeSerial(port);
     const device = new MeshDevice(transport);
     device.log.settings.minLevel = 4;
     const channels: Protobuf.Channel.Channel[] = [];
     const pending: Protobuf.Mesh.MeshPacket[] = [];
+    const nodeNames = new Map<number, string>();
     let localNode = 0;
     let routePacket: ((packet: Protobuf.Mesh.MeshPacket) => void) | undefined;
     let resolveDisconnected!: () => void;
     const disconnected = new Promise<void>((resolve) => { resolveDisconnected = resolve; });
 
-    this.nodeNames.clear();
     device.events.onMyNodeInfo.subscribe((info) => { localNode = info.myNodeNum; });
     device.events.onChannelPacket.subscribe((channel) => channels.push(channel));
     device.events.onNodeInfoPacket.subscribe((info) => {
-      if (info.user?.longName) this.nodeNames.set(info.num, safeDisplayName(info.user.longName));
+      if (info.user?.longName) nodeNames.set(info.num, safeDisplayName(info.user.longName));
     });
     device.events.onUserPacket.subscribe((packet) => {
-      if (packet.data.longName) this.nodeNames.set(packet.from, safeDisplayName(packet.data.longName));
+      if (packet.data.longName) nodeNames.set(packet.from, safeDisplayName(packet.data.longName));
     });
-    device.events.onMeshPacket.subscribe((packet) => routePacket ? routePacket(packet) : pending.push(packet));
+    device.events.onMeshPacket.subscribe((packet) => {
+      if (routePacket) routePacket(packet);
+      else if (pending.length < this.config.queueLimit) pending.push(packet);
+      else {
+        this.status.count("rejected");
+        this.status.event("warn", "MESH_STARTUP_QUEUE_FULL", { serialPort: serialPath, packetId: packet.id });
+      }
+    });
     device.events.onDeviceStatus.subscribe((state) => {
       if (state === Types.DeviceStatusEnum.DeviceDisconnected) resolveDisconnected();
     });
@@ -338,18 +362,26 @@ export class BridgeService {
         channel,
         localNode,
         disconnected,
-        close: async () => device.disconnect(),
+        activate: () => {
+          this.nodeNames = nodeNames;
+          routePacket = (packet) => this.handleMeshPacket(packet, session);
+          pending.splice(0).forEach(routePacket);
+          device.setHeartbeatInterval(300_000);
+          this.status.connection({
+            serialPort: serialPath,
+            localNode: `!${localNode.toString(16).padStart(8, "0")}`,
+            meshChannel: String(channel),
+          });
+        },
+        close: async () => {
+          const graceful = device.disconnect().catch(() => undefined);
+          await Promise.race([graceful, delay(1_000)]);
+          await transport.disconnect().catch(() => undefined);
+        },
       };
-      routePacket = (packet) => this.handleMeshPacket(packet, session);
-      pending.splice(0).forEach(routePacket);
-      device.setHeartbeatInterval(300_000);
-      this.status.connection({
-        localNode: `!${localNode.toString(16).padStart(8, "0")}`,
-        meshChannel: String(channel),
-      });
       return session;
     } catch (error) {
-      await device.disconnect().catch(() => undefined);
+      await transport.disconnect().catch(() => undefined);
       if (/channel named|not encrypted|invalid index/i.test(reason(error))) throw new FatalConfigurationError(reason(error));
       throw error;
     }

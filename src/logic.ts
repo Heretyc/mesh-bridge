@@ -101,6 +101,16 @@ export function splitDiscordForMesh(displayName: string, body: string): string[]
   throw new Error("Could not stabilize Meshtastic chunk numbering");
 }
 
+export async function discoverMeshtasticPath(paths: readonly string[], probe: (path: string) => Promise<boolean>): Promise<string> {
+  if (paths.length === 0) throw new Error("No USB serial device found; connect a Meshtastic device");
+  const matches: string[] = [];
+  // ponytail: sequential probing avoids opening unrelated serial devices concurrently; parallelize only if many-port startup latency matters.
+  for (const path of paths) if (await probe(path)) matches.push(path);
+  if (matches.length === 0) throw new Error(`No Meshtastic device found among USB serial ports (${paths.join(", ")})`);
+  if (matches.length > 1) throw new Error(`Multiple Meshtastic devices found (${matches.join(", ")}); connect exactly one`);
+  return matches[0]!;
+}
+
 export async function retry<T>(operation: () => Promise<T>, retries: number, onRetry?: (attempt: number) => void): Promise<T> {
   let lastError: unknown;
   for (let attempt = 0; attempt <= retries; attempt += 1) {

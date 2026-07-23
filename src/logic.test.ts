@@ -5,6 +5,7 @@ import {
   BoundedQueue,
   MESHTASTIC_TEXT_BYTES,
   TtlDedup,
+  discoverMeshtasticPath,
   resolveEncryptedChannel,
   retry,
   safeAttachmentName,
@@ -54,6 +55,18 @@ test("encrypted channel resolution fails closed", () => {
   assert.throws(() => resolveEncryptedChannel([channel, { ...channel, index: 3 }], "private"), /ambiguous/u);
   assert.throws(() => resolveEncryptedChannel([{ ...channel, psk: new Uint8Array() }], "private"), /not encrypted/u);
   assert.throws(() => resolveEncryptedChannel([{ ...channel, psk: new Uint8Array([0]) }], "private"), /not encrypted/u);
+});
+
+test("serial discovery selects one Meshtastic radio among unrelated USB ports", async () => {
+  const probed: string[] = [];
+  assert.equal(await discoverMeshtasticPath(["COM3", "COM4"], async (path) => {
+    probed.push(path);
+    return path === "COM4";
+  }), "COM4");
+  assert.deepEqual(probed, ["COM3", "COM4"]);
+  await assert.rejects(discoverMeshtasticPath([], async () => false), /No USB serial device/u);
+  await assert.rejects(discoverMeshtasticPath(["COM3"], async () => false), /No Meshtastic device/u);
+  await assert.rejects(discoverMeshtasticPath(["COM3", "COM4"], async () => true), /Multiple Meshtastic devices/u);
 });
 
 test("UTF-8 chunks include stable numbering and attribution inside 233 bytes", () => {

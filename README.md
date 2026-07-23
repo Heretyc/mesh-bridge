@@ -6,7 +6,7 @@ Windows-only, headless Discord ↔ Meshtastic USB serial bridge. The Discord bot
 
 - Windows 10/11 x64 and PowerShell 5.1+
 - Node.js 22 or newer
-- One Meshtastic USB serial device connected (and no other USB serial devices during discovery)
+- Exactly one Meshtastic USB serial device connected; unrelated USB serial devices may remain connected
 - One enabled, encrypted Meshtastic channel with a unique name of at most 11 UTF-8 bytes
 - Administrator access only for Windows service installation and control
 
@@ -27,7 +27,7 @@ The bot validates its username, channel visibility, and these two permissions at
 
 Configure the desired channel on the radio first. Put its exact, case-sensitive name in `MESHTASTIC_CHANNEL_NAME`; the PSK remains on the radio and is never stored by this service. Startup fails closed if the name is missing, duplicated, disabled, unencrypted, or outside channel indexes 0–7. The local node number and node long names are learned during device configuration.
 
-USB discovery considers Windows serial ports backed by USB metadata. Zero candidates and multiple candidates are reported clearly and retried with exponential backoff. Unplug unrelated USB serial adapters so exactly one candidate remains.
+USB discovery considers Windows serial ports backed by USB metadata, probes them sequentially with the official Meshtastic configuration handshake, and activates forwarding only after exactly one radio responds. Locked and non-Meshtastic ports are rejected; zero or multiple responsive radios fail closed and retry with exponential backoff.
 
 ## Install and configure
 
@@ -96,7 +96,7 @@ No message contents or secrets are written to the structured log. Message text e
 ## Recovery
 
 - **Missing configuration:** run `node dist\service.js` interactively; the fatal error names the missing/invalid variable.
-- **Zero or multiple serial devices:** unplug unrelated adapters, reconnect one Meshtastic radio, and watch `npm run tui`; retry is automatic.
+- **Zero or multiple Meshtastic radios:** connect exactly one configured radio and watch `npm run tui`; unrelated or locked USB serial ports are reported as rejected and retry is automatic.
 - **Channel failure:** correct the exact encrypted channel name on the radio and in `.env`, then restart the service.
 - **Discord failure:** confirm the bot is named `Mesh Bridge`, Message Content Intent is enabled, the channel ID is correct, and only View Channel + Send Messages are granted.
 - **Service will not start:** inspect `logs\MeshBridge.wrapper.log` and `logs\mesh-bridge.jsonl`, then run `node dist\service.js` interactively after stopping the service.
@@ -104,7 +104,7 @@ No message contents or secrets are written to the structured log. Message text e
 
 ## Known limitations
 
-- Automatic discovery intentionally fails if any second USB serial device is present; there is no unsafe "pick the first port" fallback.
+- Discovery probes accessible USB serial ports sequentially, so an unrelated responsive port can delay startup by up to `CONFIG_TIMEOUT_MS`. It never picks the first port and still fails closed if zero or multiple Meshtastic radios answer.
 - The official Meshtastic packages publish incomplete declaration aliases. Application code remains strict TypeScript, while `skipLibCheck` is enabled only for dependency declaration files.
 - The official core ACK timeout is 60 seconds. With the default two retries, a final radio failure can take about three minutes.
 - State, deduplication, names, and pending work are memory-only and reset on service restart.
