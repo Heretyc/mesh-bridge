@@ -1,0 +1,34 @@
+{
+  "name": "mesh-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "test": "npm run build && node --test dist/*.test.js",
+    "start": "node dist/service.js",
+    "tui": "node dist/tui.js",
+    "service:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install.ps1",
+    "service:start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start.ps1",
+    "service:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop.ps1",
+    "service:status": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/status.ps1",
+    "service:uninstall": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/uninstall.ps1"
+  },
+  "dependencies": {
+    "@meshtastic/core": "2.6.7",
+    "@meshtastic/protobufs": "2.7.8",
+    "@meshtastic/transport-node-serial": "0.0.2",
+    "discord.js": "14.27.0",
+    "serialport": "13.0.0",
+    "ste-simple-events": "3.0.11",
+    "tslog": "4.9.3"
+  },
+  "devDependencies": {
+    "@types/node": "24.1.0",
+    "typescript": "5.8.3"
+  }
+}
