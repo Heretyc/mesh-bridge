@@ -19,6 +19,7 @@ import {
   delay,
   discoverMeshtasticPath,
   formatMeshForDiscord,
+  resolveDiscordMentions,
   resolveEncryptedChannel,
   retry,
   safeAttachmentName,
@@ -203,7 +204,13 @@ export class BridgeService {
 
   private async handleDiscordMessage(message: Message): Promise<void> {
     const attachmentNames = message.attachments.map((attachment) => safeAttachmentName(attachment.name));
-    const body = [message.content, ...attachmentNames].filter(Boolean).join(" ");
+    // Resolve mentions before attachments and chunking so the substituted names are charged to the 232-byte ceiling.
+    const mentionNames = {
+      members: new Map(message.mentions.members?.map((member) => [member.id, member.displayName] as const) ?? []),
+      users: new Map(message.mentions.users.map((user) => [user.id, user.displayName] as const)),
+      roles: new Map(message.mentions.roles.map((role) => [role.id, role.name] as const)),
+    };
+    const body = [resolveDiscordMentions(message.content, mentionNames), ...attachmentNames].filter(Boolean).join(" ");
     const ordinary = message.type === MessageType.Default || message.type === MessageType.Reply;
     if (!shouldForwardDiscord({
       channelId: message.channelId,

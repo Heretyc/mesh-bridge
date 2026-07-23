@@ -60,6 +60,28 @@ export function safeAttachmentName(name: string): string {
   return (name.split(/[\\/]/u).at(-1) ?? "attachment").replace(/[\u0000-\u001f\u007f]/gu, "");
 }
 
+export interface DiscordMentionNames {
+  /** Guild member display names (nickname when set), keyed by user id. */
+  members: ReadonlyMap<string, string>;
+  /** Mentioned user display names, keyed by user id; used only when the member name is missing. */
+  users: ReadonlyMap<string, string>;
+  /** Role names, keyed by role id. */
+  roles: ReadonlyMap<string, string>;
+}
+
+// Only these three forms are rewritten. Channel (<#id>), slash-command (</name:id>), and custom emoji
+// (<:name:id>, <a:name:id>) markup cannot match, because none of them place a digit or "&" after "<@".
+const DISCORD_MENTION = /<@!?(\d{1,32})>|<@&(\d{1,32})>/gu;
+
+export function resolveDiscordMentions(content: string, names: DiscordMentionNames): string {
+  return content.replace(DISCORD_MENTION, (match: string, userId: string | undefined, roleId: string | undefined) => {
+    let name: string | undefined;
+    if (userId === undefined) name = names.roles.get(roleId!);
+    else name = names.members.get(userId) || names.users.get(userId);
+    return name ? `@${name}` : match;
+  });
+}
+
 function byteLength(value: string): number {
   return encoder.encode(value).byteLength;
 }
@@ -69,7 +91,7 @@ function splitOnce(body: string, name: string, total: number): string[] {
   const pieces: string[] = [];
   let start = 0;
   while (start < graphemes.length) {
-    const prefix = `${name}: (${pieces.length + 1}/${total}) `;
+    const prefix = `[${name}]: (${pieces.length + 1}/${total}) `;
     const capacity = MESHTASTIC_TEXT_BYTES - byteLength(prefix);
     if (capacity < 1) throw new Error("Discord display name leaves no room for Meshtastic text");
 
@@ -100,12 +122,12 @@ function splitOnce(body: string, name: string, total: number): string[] {
 export function splitDiscordForMesh(displayName: string, body: string): string[] {
   if (!body) return [];
   const name = safeDisplayName(displayName);
-  const single = `${name}: ${body}`;
+  const single = `[${name}]: ${body}`;
   if (byteLength(single) <= MESHTASTIC_TEXT_BYTES) return [single];
   let total = 2;
   for (let pass = 0; pass < 20; pass += 1) {
     const pieces = splitOnce(body, name, total);
-    if (pieces.length === total) return pieces.map((piece, index) => `${name}: (${index + 1}/${total}) ${piece}`);
+    if (pieces.length === total) return pieces.map((piece, index) => `[${name}]: (${index + 1}/${total}) ${piece}`);
     total = pieces.length;
   }
   throw new Error("Could not stabilize Meshtastic chunk numbering");

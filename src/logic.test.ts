@@ -7,6 +7,7 @@ import {
   TtlDedup,
   discoverMeshtasticPath,
   formatMeshForDiscord,
+  resolveDiscordMentions,
   resolveEncryptedChannel,
   retry,
   safeAttachmentName,
@@ -80,14 +81,81 @@ test("UTF-8 chunks include stable numbering and attribution inside 232 bytes", (
   const reconstructed: string[] = [];
   for (const [index, chunk] of chunks.entries()) {
     assert.ok(Buffer.byteLength(chunk, "utf8") <= MESHTASTIC_TEXT_BYTES);
-    const marker = `Display 😀: (${index + 1}/${chunks.length}) `;
+    const marker = `[Display 😀]: (${index + 1}/${chunks.length}) `;
     assert.ok(chunk.startsWith(marker));
     reconstructed.push(chunk.slice(marker.length));
   }
   assert.equal(reconstructed.join(""), body);
-  assert.equal(splitDiscordForMesh("A", "short")[0], "A: short");
-  assert.equal(Buffer.byteLength(splitDiscordForMesh("A", "x".repeat(229))[0]!, "utf8"), MESHTASTIC_TEXT_BYTES);
-  assert.match(splitDiscordForMesh("A", "x".repeat(230))[0]!, /^A: \(1\/2\) /u);
+});
+
+test("Discord attribution is bracketed for single chunks and every split chunk", () => {
+  assert.deepEqual(splitDiscordForMesh("Ada Lovelace", "short"), ["[Ada Lovelace]: short"]);
+  assert.deepEqual(splitDiscordForMesh("Ada Lovelace", ""), []);
+
+  const chunks = splitDiscordForMesh("Ada Lovelace", "word ".repeat(120).trim());
+  assert.ok(chunks.length > 1);
+  for (const [index, chunk] of chunks.entries()) {
+    assert.ok(chunk.startsWith(`[Ada Lovelace]: (${index + 1}/${chunks.length}) `));
+    assert.ok(Buffer.byteLength(chunk, "utf8") <= MESHTASTIC_TEXT_BYTES);
+  }
+
+  // Brackets and marker are charged to the ceiling: "[A]: " is five bytes, so 227 body bytes exactly fill one chunk.
+  assert.equal(Buffer.byteLength(splitDiscordForMesh("A", "x".repeat(227))[0]!, "utf8"), MESHTASTIC_TEXT_BYTES);
+  assert.match(splitDiscordForMesh("A", "x".repeat(228))[0]!, /^\[A\]: \(1\/2\) /u);
+});
+
+const mentionNames = {
+  members: new Map([["123456789012345678", "Ada the Admin"]]),
+  users: new Map([["123456789012345678", "ada"], ["222222222222222222", "Grace Hopper"]]),
+  roles: new Map([["876543210987654321", "Mesh Ops"]]),
+};
+
+test("user mentions resolve to the guild member name and fall back to the user name", () => {
+  assert.equal(resolveDiscordMentions("<@123456789012345678>", mentionNames), "@Ada the Admin");
+  assert.equal(resolveDiscordMentions("<@!123456789012345678>", mentionNames), "@Ada the Admin");
+  assert.equal(resolveDiscordMentions("<@222222222222222222>", mentionNames), "@Grace Hopper");
+  assert.equal(resolveDiscordMentions("hi <@!222222222222222222> and <@123456789012345678>!", mentionNames),
+    "hi @Grace Hopper and @Ada the Admin!");
+});
+
+test("role mentions resolve to the role name and unknown ids stay unchanged", () => {
+  assert.equal(resolveDiscordMentions("<@&876543210987654321> ping", mentionNames), "@Mesh Ops ping");
+  assert.equal(resolveDiscordMentions("<@999999999999999999>", mentionNames), "<@999999999999999999>");
+  assert.equal(resolveDiscordMentions("<@!999999999999999999>", mentionNames), "<@!999999999999999999>");
+  assert.equal(resolveDiscordMentions("<@&999999999999999999>", mentionNames), "<@&999999999999999999>");
+  assert.equal(resolveDiscordMentions("<@123456789012345678> <@&999999999999999999>", mentionNames),
+    "@Ada the Admin <@&999999999999999999>");
+});
+
+test("non-mention Discord markup, URLs, and plain text pass through byte-for-byte", () => {
+  for (const untouched of [
+    "https://example.test/a?b=1&c=2#frag",
+    "<#123456789012345678>",
+    "</deploy:123456789012345678>",
+    "<:smile:123456789012345678>",
+    "<a:wave:123456789012345678>",
+    "<t:1700000000:R>",
+    "@everyone @here plain text 😀",
+    "<@123456789012345678", // unterminated
+    "<@abc>",
+  ]) assert.equal(resolveDiscordMentions(untouched, mentionNames), untouched);
+
+  // A mention is substituted wherever it appears, including inside a URL: Discord itself renders it as a
+  // mention there, and making the resolver URL-aware would cost more than it protects.
+  assert.equal(resolveDiscordMentions("https://example.test/a?u=<@123456789012345678>", mentionNames),
+    "https://example.test/a?u=@Ada the Admin");
+});
+
+test("resolved mention text is charged to the byte ceiling by attribution and numbering", () => {
+  const resolved = resolveDiscordMentions("<@123456789012345678> <@&876543210987654321>", mentionNames);
+  assert.equal(resolved, "@Ada the Admin @Mesh Ops");
+  assert.deepEqual(splitDiscordForMesh("Grace", resolved), ["[Grace]: @Ada the Admin @Mesh Ops"]);
+
+  const long = resolveDiscordMentions(`<@123456789012345678> ${"x".repeat(220)}`, mentionNames);
+  const chunks = splitDiscordForMesh("A", long);
+  assert.ok(chunks.length > 1);
+  for (const chunk of chunks) assert.ok(Buffer.byteLength(chunk, "utf8") <= MESHTASTIC_TEXT_BYTES);
+  assert.ok(chunks[0]!.startsWith("[A]: (1/2) @Ada the Admin"));
 });
 
 test("ACK retry is bounded and observable with a mock sender", async () => {
