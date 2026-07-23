@@ -79,7 +79,7 @@ The TUI shows link states, serial port, local node ID, resolved channel index, q
 
 Discord → Mesh accepts only ordinary user messages (including replies, but not referenced reply content) in `DISCORD_CHANNEL_ID`. Bots, webhooks, system messages, duplicate Discord IDs, embeds, stickers, and empty messages are ignored. Plain message text and URLs are unchanged; attachment URLs and bodies are ignored, while each safe filename and extension is appended.
 
-A message that fits one mesh packet is formatted as `Display name: text`. Split messages use `Display name: (i/n) text` on every chunk. Chunks are split on whitespace where possible and otherwise at Unicode grapheme boundaries. Attribution and numbering count against the official 233-byte Meshtastic data-payload limit. Sends are paced, request ACKs, and use bounded retries. Queue rejection and partial/final delivery failures are reported to Discord and the TUI without repeating message content.
+A message that fits one mesh packet is formatted as `Display name: text`. Split messages use `Display name: (i/n) text` on every chunk. Chunks are split on whitespace where possible and otherwise at Unicode grapheme boundaries. Attribution and numbering count against the 232-byte UTF-8 text ceiling: current firmware permits a 239-byte encoded `Data` envelope after the 16-byte radio header, and the text port plus required bitfield consume seven encoded bytes. Sends are paced, request ACKs, and use bounded retries. Queue rejection and partial/final delivery failures are reported to Discord and the TUI without repeating message content.
 
 Mesh → Discord accepts only decoded `TEXT_MESSAGE_APP` packets on the resolved channel. Broadcasts and direct messages are both forwarded; local-node echoes and bounded-TTL duplicates are suppressed. Output is `**[Mesh long name]:** text`, with Discord Markdown escaped inside the name and `Unknown !nodeid` used only when the radio has not supplied a long name. Mentions are disabled.
 
@@ -114,7 +114,8 @@ No message contents or secrets are written to the structured log. Message text e
 
 - [Meshtastic Web v2.7.1 Node serial transport](https://github.com/meshtastic/web/tree/v2.7.1/packages/transport-node-serial)
 - [Meshtastic Web v2.7.1 core](https://github.com/meshtastic/web/tree/v2.7.1/packages/core)
-- [Meshtastic firmware payload constant](https://github.com/meshtastic/firmware/blob/master/src/mesh/generated/meshtastic/mesh.pb.h)
+- [Meshtastic firmware encoded-payload size check](https://github.com/meshtastic/firmware/blob/master/src/mesh/Router.cpp#L593-L631)
+- [Meshtastic firmware radio payload and header constants](https://github.com/meshtastic/firmware/blob/master/src/mesh/RadioInterface.h#L20-L22)
 - [Discord Gateway intents and Message Content](https://docs.discord.com/developers/events/gateway#gateway-intents)
 - [Discord OAuth2 scopes and permissions](https://docs.discord.com/developers/platform/oauth2-and-permissions)
 - [Discord.js 14.27.0 Client](https://discord.js.org/docs/packages/discord.js/14.27.0/Client:Class)

@@ -72,7 +72,7 @@ test("serial discovery selects one Meshtastic radio among unrelated USB ports", 
   await assert.rejects(discoverMeshtasticPath(["COM3", "COM4"], async () => true), /Multiple Meshtastic devices/u);
 });
 
-test("UTF-8 chunks include stable numbering and attribution inside 233 bytes", () => {
+test("UTF-8 chunks include stable numbering and attribution inside 232 bytes", () => {
   const url = `https://example.test/${"path/".repeat(35)}end?x=1&y=2`;
   const body = `hello 😀 ${url} ${"word ".repeat(100)}`;
   const chunks = splitDiscordForMesh("Display 😀", body);
@@ -86,8 +86,8 @@ test("UTF-8 chunks include stable numbering and attribution inside 233 bytes", (
   }
   assert.equal(reconstructed.join(""), body);
   assert.equal(splitDiscordForMesh("A", "short")[0], "A: short");
-  assert.equal(Buffer.byteLength(splitDiscordForMesh("A", "x".repeat(230))[0]!, "utf8"), MESHTASTIC_TEXT_BYTES);
-  assert.match(splitDiscordForMesh("A", "x".repeat(231))[0]!, /^A: \(1\/2\) /u);
+  assert.equal(Buffer.byteLength(splitDiscordForMesh("A", "x".repeat(229))[0]!, "utf8"), MESHTASTIC_TEXT_BYTES);
+  assert.match(splitDiscordForMesh("A", "x".repeat(230))[0]!, /^A: \(1\/2\) /u);
 });
 
 test("ACK retry is bounded and observable with a mock sender", async () => {

@@ -1,6 +1,7 @@
 import { escapeMarkdown } from "discord.js";
 
-export const MESHTASTIC_TEXT_BYTES = 233;
+// Firmware adds the encoded Data port and bitfield to text before enforcing the 239-byte encrypted envelope.
+export const MESHTASTIC_TEXT_BYTES = 232;
 const encoder = new TextEncoder();
 const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
