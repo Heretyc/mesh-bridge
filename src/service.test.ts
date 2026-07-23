@@ -48,7 +48,6 @@ interface Internals {
 interface ReactionJob {
   targetDiscordId: string;
   tapback: string;
-  codepoint: number;
   replyText: string;
 }
 
@@ -213,7 +212,7 @@ test("mesh heart tapback reacts natively, never sends text, and aliases its pack
         portnum: 1,
         payload: new TextEncoder().encode("❤️"),
         replyId: 555,
-        emoji: 0x2764,
+        emoji: 1,
       },
     },
   }, { channel: 3, localNode: 7 });
@@ -223,6 +222,51 @@ test("mesh heart tapback reacts natively, never sends text, and aliases its pack
   assert.deepEqual(textSends, []);
   assert.equal(internals.replies.discordTargetFor(700), "discord-target");
   assert.equal(internals.replies.meshRootFor("discord-target"), 555);
+});
+
+test("invalid mesh tapbacks are rejected without text delivery or payload logging", async (t) => {
+  const internals = newService(t);
+  const delivered: string[] = [];
+  internals.replies.recordOutboundChunk("discord-target", 0, 555);
+  internals.discordChannel = {
+    send: async (options) => {
+      delivered.push(String(options.content));
+      return { id: "unexpected", reference: null };
+    },
+    messages: { fetch: async () => ({ react: async (emoji) => { delivered.push(emoji); } }) },
+  };
+  internals.meshToDiscord.start((job) => internals.deliverInbound(job));
+
+  for (const [index, [payload, replyId]] of ([
+    ["", 555],
+    ["\u0000", 555],
+    ["secret-invalid", 555],
+    ["❤️", 0],
+  ] as const).entries()) {
+    internals.handleMeshPacket({
+      id: 710 + index,
+      from: 42,
+      to: 0,
+      channel: 3,
+      rxTime: 1,
+      payloadVariant: {
+        case: "decoded",
+        value: {
+          portnum: 1,
+          payload: new TextEncoder().encode(payload),
+          replyId,
+          emoji: 1,
+        },
+      },
+    }, { channel: 3, localNode: 7 });
+  }
+  assert.equal(await internals.meshToDiscord.drain(1_000), true);
+
+  const snapshot = internals.status.snapshot();
+  assert.deepEqual(delivered, []);
+  assert.equal(snapshot.counters.rejected, 4);
+  assert.equal(snapshot.events.filter((event) => event.code === "MESH_TAPBACK_INVALID").length, 4);
+  assert.ok(snapshot.events.every((event) => !event.detail.includes("secret-invalid")));
 });
 
 test("mesh tapback target and REST failures are counted and never log payload content", async (t) => {
@@ -251,7 +295,7 @@ test("supported and custom Discord reactions produce exact ordered tapback and r
       root: 500,
       emoji: { id: null, name: "❤️" },
       expected: [
-        ["❤️", "broadcast", true, 3, 500, 0x2764],
+        ["❤️", "broadcast", true, 3, 500, 1],
         ["❤️[Server Nick]: Reacted with ❤️", "broadcast", true, 3, 500],
       ],
       correlate: (internals: Internals) => internals.replies.recordOutboundChunk("discord-origin", 0, 500),
@@ -261,7 +305,7 @@ test("supported and custom Discord reactions produce exact ordered tapback and r
       root: 600,
       emoji: { id: "custom-id", name: "lol" },
       expected: [
-        ["✳️", "broadcast", true, 3, 600, 0x2733],
+        ["✳️", "broadcast", true, 3, 600, 1],
         ["✳️[Server Nick]: Reacted with :lol:", "broadcast", true, 3, 600],
       ],
       correlate: (internals: Internals) => internals.replies.recordInbound(600, "bridge-bot-post"),
@@ -395,14 +439,13 @@ test("uncorrelated Discord reaction reports 0/2, and first-leg failure still att
     await internals.deliverDiscordReactionToMesh({
       targetDiscordId: "target",
       tapback: "❤️",
-      codepoint: 0x2764,
       replyText: "secret reaction content",
     });
 
     assert.deepEqual(sends, [
-      ["❤️", "broadcast", true, 3, 900, 0x2764],
-      ["❤️", "broadcast", true, 3, 900, 0x2764],
-      ["❤️", "broadcast", true, 3, 900, 0x2764],
+      ["❤️", "broadcast", true, 3, 900, 1],
+      ["❤️", "broadcast", true, 3, 900, 1],
+      ["❤️", "broadcast", true, 3, 900, 1],
       ["secret reaction content", "broadcast", true, 3, 900],
     ]);
     assert.deepEqual(reports, ["Mesh Bridge: reaction delivery partially failed; 1/2 packets acknowledged."]);

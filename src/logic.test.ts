@@ -60,10 +60,10 @@ test("Discord reaction routing accepts configured-channel users only", () => {
 
 test("Discord reactions preserve one base codepoint plus optional VS16 and fall back for every other grapheme", () => {
   assert.deepEqual(classifyDiscordReaction({ id: null, name: "😀" }), {
-    tapback: "😀", codepoint: 0x1f600, display: "😀", supported: true,
+    tapback: "😀", display: "😀", supported: true,
   });
   const heart = classifyDiscordReaction({ id: null, name: "❤️" });
-  assert.deepEqual(heart, { tapback: "❤️", codepoint: 0x2764, display: "❤️", supported: true });
+  assert.deepEqual(heart, { tapback: "❤️", display: "❤️", supported: true });
   assert.equal(formatReactionForMesh(heart, "Ada]"), "❤️[Ada]]: Reacted with ❤️");
 
   for (const [emoji, display] of [
@@ -73,21 +73,19 @@ test("Discord reactions preserve one base codepoint plus optional VS16 and fall 
     [{ id: null, name: "👩‍💻" }, "👩‍💻"],
   ] as const) {
     const plan = classifyDiscordReaction(emoji);
-    assert.deepEqual(plan, { tapback: "✳️", codepoint: 0x2733, display, supported: false });
+    assert.deepEqual(plan, { tapback: "✳️", display, supported: false });
   }
 });
 
-test("mesh tapbacks require emoji and reply ids and preserve payload VS16 with a safe codepoint fallback", () => {
+test("mesh tapbacks require emoji and reply ids and accept only the decoded emoji payload", () => {
   assert.equal(isMeshTapback({ emoji: 0x2764, replyId: 42 }), true);
   assert.equal(isMeshTapback({ emoji: 0, replyId: 42 }), false);
   assert.equal(isMeshTapback({ emoji: 0x2764, replyId: 0 }), false);
-  assert.equal(meshTapbackEmoji("❤️", 0x2764), "❤️");
-  assert.equal(meshTapbackEmoji("", 0x1f600), "😀");
-  assert.equal(meshTapbackEmoji("\u0000", 0x2764), "❤");
-  assert.equal(meshTapbackEmoji("👍🏽", 0x1f44d), "👍");
-  assert.equal(meshTapbackEmoji("wrong", 0x2764), "❤");
-  assert.equal(meshTapbackEmoji("", 0xd800), undefined);
-  assert.equal(meshTapbackEmoji("", 0x110000), undefined);
+  assert.equal(meshTapbackEmoji("❤️"), "❤️");
+  assert.equal(meshTapbackEmoji("😀"), "😀");
+  for (const invalid of ["", "\u0000", "wrong", " ❤️ ", "👍🏽", "🇺🇸", "👩‍💻"]) {
+    assert.equal(meshTapbackEmoji(invalid), undefined);
+  }
 });
 
 test("Mesh routing scopes text to the channel, includes broadcasts and DMs, and blocks local loops", () => {

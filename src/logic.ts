@@ -81,7 +81,6 @@ export function shouldForwardDiscordReaction(input: DiscordReactionRouteInput, c
 
 /** Stand-in tapback for every reaction the single-base-emoji tapback format cannot carry. */
 export const UNSUPPORTED_TAPBACK = "✳️";
-export const UNSUPPORTED_TAPBACK_CODEPOINT = 0x2733;
 const VARIATION_SELECTOR_16 = 0xfe0f;
 
 export interface DiscordReactionEmoji {
@@ -94,8 +93,6 @@ export interface DiscordReactionEmoji {
 export interface TapbackPlan {
   /** Grapheme sent as the mesh tapback payload and repeated as the reply prefix. */
   tapback: string;
-  /** Base codepoint carried in Data.emoji alongside the tapback payload. */
-  codepoint: number;
   /** What the reactor actually picked, echoed verbatim in the reply text. */
   display: string;
   supported: boolean;
@@ -110,7 +107,6 @@ export interface TapbackPlan {
 export function classifyDiscordReaction(emoji: DiscordReactionEmoji): TapbackPlan {
   const unsupported = (display: string): TapbackPlan => ({
     tapback: UNSUPPORTED_TAPBACK,
-    codepoint: UNSUPPORTED_TAPBACK_CODEPOINT,
     display,
     supported: false,
   });
@@ -122,7 +118,7 @@ export function classifyDiscordReaction(emoji: DiscordReactionEmoji): TapbackPla
   if (points.length > 2 || (points.length === 2 && points[1]!.codePointAt(0) !== VARIATION_SELECTOR_16)) {
     return unsupported(name);
   }
-  return { tapback: name, codepoint: base, display: name, supported: true };
+  return { tapback: name, display: name, supported: true };
 }
 
 /** The plain-text leg of a Discord reaction: `<tapback>[<display name>]: Reacted with <what was picked>`. */
@@ -147,22 +143,16 @@ function printableGrapheme(text: string): boolean {
   });
 }
 
-/**
- * Prefer the decoded payload so a VS16-qualified grapheme survives intact, and fall back to the Data.emoji
- * codepoint only when the payload is empty or is not a plausible emoji grapheme. Returns undefined when
- * neither source yields something that can be handed to the Discord reaction API.
- */
-export function meshTapbackEmoji(payload: string, codepoint: number): string | undefined {
-  if (!Number.isInteger(codepoint) || codepoint < 0x20 || codepoint > 0x10ffff) return undefined;
-  if (codepoint >= 0xd800 && codepoint <= 0xdfff) return undefined;
-  const text = payload.trim();
+/** Return the decoded single-base emoji payload, never the numeric Data.emoji flag. */
+export function meshTapbackEmoji(payload: string): string | undefined {
+  const text = payload;
   const points = [...text];
   if (
     printableGrapheme(text)
-    && points[0]?.codePointAt(0) === codepoint
+    && /^\p{Extended_Pictographic}$/u.test(points[0] ?? "")
     && (points.length === 1 || (points.length === 2 && points[1]!.codePointAt(0) === VARIATION_SELECTOR_16))
   ) return text;
-  return String.fromCodePoint(codepoint);
+  return undefined;
 }
 
 export function safeAttachmentName(name: string): string {

@@ -58,8 +58,6 @@ interface DiscordReactionJob {
   targetDiscordId: string;
   /** Grapheme sent as the native tapback payload. */
   tapback: string;
-  /** Base codepoint set in Data.emoji beside the tapback payload. */
-  codepoint: number;
   /** Ordinary reply text sent after the tapback so clients without tapback rendering still see the reaction. */
   replyText: string;
 }
@@ -329,7 +327,6 @@ export class BridgeService {
     const job: DiscordReactionJob = {
       targetDiscordId: message.id,
       tapback: plan.tapback,
-      codepoint: plan.codepoint,
       replyText: formatReactionForMesh(plan, displayName),
     };
     if (!this.discordToMesh.enqueue(job)) {
@@ -393,7 +390,7 @@ export class BridgeService {
 
     let delivered = 0;
     for (const [index, leg] of [
-      { text: job.tapback, emoji: job.codepoint },
+      { text: job.tapback, emoji: 1 },
       { text: job.replyText, emoji: undefined },
     ].entries()) {
       try {
@@ -601,7 +598,7 @@ export class BridgeService {
     this.status.count("meshReceived");
     if (data.emoji !== 0) {
       const emoji = isMeshTapback({ emoji: data.emoji, replyId: data.replyId })
-        ? meshTapbackEmoji(text, data.emoji)
+        ? meshTapbackEmoji(text)
         : undefined;
       if (emoji === undefined) {
         this.status.count("rejected");
