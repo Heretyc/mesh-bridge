@@ -6,6 +6,7 @@ import {
   MESHTASTIC_TEXT_BYTES,
   TtlDedup,
   discoverMeshtasticPath,
+  formatMeshForDiscord,
   resolveEncryptedChannel,
   retry,
   safeAttachmentName,
@@ -46,6 +47,8 @@ test("Mesh routing scopes text to the channel, includes broadcasts and DMs, and 
   assert.equal(shouldForwardMesh({ ...base, portNum: 67 }, 3, 7), false);
   assert.equal(shouldForwardMesh({ ...base, channel: 2 }, 3, 7), false);
   assert.equal(shouldForwardMesh({ ...base, from: 7 }, 3, 7), false);
+  assert.equal(formatMeshForDiscord("Long Name", "hello"), "**[Long Name]:** hello");
+  assert.equal(formatMeshForDiscord("A**B]", "hello"), "**[A\\*\\*B\\]]:** hello");
 });
 
 test("encrypted channel resolution fails closed", () => {

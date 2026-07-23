@@ -18,6 +18,7 @@ import {
   backoff,
   delay,
   discoverMeshtasticPath,
+  formatMeshForDiscord,
   resolveEncryptedChannel,
   retry,
   safeAttachmentName,
@@ -421,7 +422,7 @@ export class BridgeService {
     const channel = await this.waitForDiscord();
     const name = this.nodeNames.get(job.from) ?? `Unknown !${job.from.toString(16).padStart(8, "0")}`;
     try {
-      await channel.send({ content: `${name}: ${job.text}`, allowedMentions });
+      await channel.send({ content: formatMeshForDiscord(name, job.text), allowedMentions });
       this.status.count("discordSent");
     } catch (error) {
       if (this.abort.signal.aborted) return;

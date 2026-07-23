@@ -1,3 +1,5 @@
+import { escapeMarkdown } from "discord.js";
+
 export const MESHTASTIC_TEXT_BYTES = 233;
 const encoder = new TextEncoder();
 const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
@@ -46,6 +48,11 @@ export function shouldForwardMesh(input: MeshRouteInput, configuredChannel: numb
 
 export function safeDisplayName(name: string): string {
   return name.replace(/[\u0000-\u001f\u007f]/gu, " ").replace(/\s+/gu, " ").trim() || "unknown";
+}
+
+export function formatMeshForDiscord(longName: string, text: string): string {
+  const escapedName = escapeMarkdown(safeDisplayName(longName)).replaceAll("[", "\\[").replaceAll("]", "\\]");
+  return `**[${escapedName}]:** ${text}`;
 }
 
 export function safeAttachmentName(name: string): string {

@@ -81,7 +81,7 @@ Discord → Mesh accepts only ordinary user messages (including replies, but not
 
 A message that fits one mesh packet is formatted as `Display name: text`. Split messages use `Display name: (i/n) text` on every chunk. Chunks are split on whitespace where possible and otherwise at Unicode grapheme boundaries. Attribution and numbering count against the official 233-byte Meshtastic data-payload limit. Sends are paced, request ACKs, and use bounded retries. Queue rejection and partial/final delivery failures are reported to Discord and the TUI without repeating message content.
 
-Mesh → Discord accepts only decoded `TEXT_MESSAGE_APP` packets on the resolved channel. Broadcasts and direct messages are both forwarded; local-node echoes and bounded-TTL duplicates are suppressed. Output is `Mesh long name: text`, with `Unknown !nodeid` only when the radio has not supplied a long name. Mentions are disabled.
+Mesh → Discord accepts only decoded `TEXT_MESSAGE_APP` packets on the resolved channel. Broadcasts and direct messages are both forwarded; local-node echoes and bounded-TTL duplicates are suppressed. Output is `**[Mesh long name]:** text`, with Discord Markdown escaped inside the name and `Unknown !nodeid` used only when the radio has not supplied a long name. Mentions are disabled.
 
 ## Reliability and logs
 
