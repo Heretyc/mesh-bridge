@@ -8,15 +8,20 @@ import {
   ReplyCorrelator,
   TtlDedup,
   TtlMap,
+  classifyDiscordReaction,
   discoverMeshtasticPath,
   formatMeshForDiscord,
+  formatReactionForMesh,
   hasRequiredDiscordPermissions,
+  isMeshTapback,
+  meshTapbackEmoji,
   replyIdForChunk,
   resolveDiscordMentions,
   resolveEncryptedChannel,
   retry,
   safeAttachmentName,
   shouldForwardDiscord,
+  shouldForwardDiscordReaction,
   shouldForwardMesh,
   splitDiscordForMesh,
 } from "./logic.js";
@@ -44,6 +49,45 @@ test("Discord routing accepts ordinary configured-channel users only", () => {
   assert.equal(shouldForwardDiscord({ ...base, ordinary: false }, validEnv.DISCORD_CHANNEL_ID!), false);
   assert.equal(shouldForwardDiscord({ ...base, hasBody: false }, validEnv.DISCORD_CHANNEL_ID!), false);
   assert.equal(safeAttachmentName("C:\\fake\\photo.JPG"), "photo.JPG");
+});
+
+test("Discord reaction routing accepts configured-channel users only", () => {
+  const base = { channelId: validEnv.DISCORD_CHANNEL_ID!, reactorBot: false };
+  assert.equal(shouldForwardDiscordReaction(base, validEnv.DISCORD_CHANNEL_ID!), true);
+  assert.equal(shouldForwardDiscordReaction({ ...base, channelId: "999999999999999999" }, validEnv.DISCORD_CHANNEL_ID!), false);
+  assert.equal(shouldForwardDiscordReaction({ ...base, reactorBot: true }, validEnv.DISCORD_CHANNEL_ID!), false);
+});
+
+test("Discord reactions preserve one base codepoint plus optional VS16 and fall back for every other grapheme", () => {
+  assert.deepEqual(classifyDiscordReaction({ id: null, name: "😀" }), {
+    tapback: "😀", codepoint: 0x1f600, display: "😀", supported: true,
+  });
+  const heart = classifyDiscordReaction({ id: null, name: "❤️" });
+  assert.deepEqual(heart, { tapback: "❤️", codepoint: 0x2764, display: "❤️", supported: true });
+  assert.equal(formatReactionForMesh(heart, "Ada]"), "❤️[Ada]]: Reacted with ❤️");
+
+  for (const [emoji, display] of [
+    [{ id: "123", name: "lol" }, ":lol:"],
+    [{ id: null, name: "👍🏽" }, "👍🏽"],
+    [{ id: null, name: "🇺🇸" }, "🇺🇸"],
+    [{ id: null, name: "👩‍💻" }, "👩‍💻"],
+  ] as const) {
+    const plan = classifyDiscordReaction(emoji);
+    assert.deepEqual(plan, { tapback: "✳️", codepoint: 0x2733, display, supported: false });
+  }
+});
+
+test("mesh tapbacks require emoji and reply ids and preserve payload VS16 with a safe codepoint fallback", () => {
+  assert.equal(isMeshTapback({ emoji: 0x2764, replyId: 42 }), true);
+  assert.equal(isMeshTapback({ emoji: 0, replyId: 42 }), false);
+  assert.equal(isMeshTapback({ emoji: 0x2764, replyId: 0 }), false);
+  assert.equal(meshTapbackEmoji("❤️", 0x2764), "❤️");
+  assert.equal(meshTapbackEmoji("", 0x1f600), "😀");
+  assert.equal(meshTapbackEmoji("\u0000", 0x2764), "❤");
+  assert.equal(meshTapbackEmoji("👍🏽", 0x1f44d), "👍");
+  assert.equal(meshTapbackEmoji("wrong", 0x2764), "❤");
+  assert.equal(meshTapbackEmoji("", 0xd800), undefined);
+  assert.equal(meshTapbackEmoji("", 0x110000), undefined);
 });
 
 test("Mesh routing scopes text to the channel, includes broadcasts and DMs, and blocks local loops", () => {
@@ -221,6 +265,13 @@ test("first mesh chunk is the canonical reply root while every chunk maps back t
   assert.equal(correlator.discordTargetFor(444, 0), "discord-3");
   assert.equal(correlator.meshRootFor("discord-3", 0), 444);
 
+  correlator.aliasMeshPacket(445, "discord-3", 0);
+  correlator.aliasMeshPacket(0, "discord-3", 0);
+  assert.equal(correlator.discordTargetFor(445, 0), "discord-3");
+  assert.equal(correlator.meshRootFor("discord-3", 0), 444); // aliases never replace the canonical root
+  assert.equal(correlator.discordTargetFor(0, 0), undefined);
+  assert.equal(correlator.discordTargetFor(445, 1_000), undefined);
+
   assert.equal(correlator.meshRootFor("discord-1", 1_000), undefined); // correlation is TTL-bounded
   assert.equal(correlator.discordTargetFor(111, 1_000), undefined);
 });
@@ -252,14 +303,17 @@ test("native replyId is sent only on the first chunk and unmapped targets relay 
   assert.equal(replyIdForChunk(0, correlator.meshRootFor("never-seen", 0)), undefined);
 });
 
-test("startup requires View Channel, Send Messages, and Read Message History", () => {
+test("startup requires View Channel, Send Messages, Read Message History, and Add Reactions", () => {
   const granted = (...bits: bigint[]) => ({ has: (needed: bigint[]) => needed.every((bit) => bits.includes(bit)) });
-  const all = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory];
+  const all = [
+    PermissionFlagsBits.ViewChannel,
+    PermissionFlagsBits.SendMessages,
+    PermissionFlagsBits.ReadMessageHistory,
+    PermissionFlagsBits.AddReactions,
+  ];
 
   assert.equal(hasRequiredDiscordPermissions(granted(...all)), true);
-  assert.equal(hasRequiredDiscordPermissions(granted(PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages)), false);
-  assert.equal(hasRequiredDiscordPermissions(granted(PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory)), false);
-  assert.equal(hasRequiredDiscordPermissions(granted(PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory)), false);
+  for (const missing of all) assert.equal(hasRequiredDiscordPermissions(granted(...all.filter((bit) => bit !== missing))), false);
   assert.equal(hasRequiredDiscordPermissions(null), false);
 });
 

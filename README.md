@@ -15,14 +15,15 @@ The bridge uses the latest published official Node serial pairing: `@meshtastic/
 ## Discord setup
 
 1. In the Discord Developer Portal, create an application and bot named literally `Mesh Bridge`.
-2. On **Bot → Privileged Gateway Intents**, enable **Message Content Intent**. No Presence or Server Members intent is used.
+2. On **Bot → Privileged Gateway Intents**, enable **Message Content Intent**. The bridge also uses the non-privileged Guild Message Reactions intent; no Presence or Server Members intent is used.
 3. Install the app to the server with the `bot` scope and only these channel permissions:
    - View Channel
    - Send Messages
    - Read Message History
+   - Add Reactions
 4. Apply those permissions only to the bridge channel, then copy that channel ID into `.env`.
 
-The bot validates its username, channel visibility, and these three permissions at startup. Read Message History is required only so native replies can reference earlier messages in the channel. It does not need Manage Messages, Mention Everyone, attachments, embeds, commands, or administrator access. Discord posts use `allowedMentions.parse = []`.
+The bot validates its username, channel visibility, and these four permissions at startup. Read Message History is required so native replies and mesh tapbacks can find earlier messages; Add Reactions is required for native mesh tapbacks. It does not need Manage Messages, Mention Everyone, attachments, embeds, commands, or administrator access. Discord posts use `allowedMentions.parse = []`.
 
 ## Meshtastic setup
 
@@ -82,6 +83,8 @@ Discord → Mesh accepts only ordinary user messages (including replies, but not
 
 Native replies are translated in both directions. A Discord reply is relayed with the Meshtastic `reply_id` of the referenced message's first mesh chunk, set only on chunk 1; continuation chunks carry no reply id. A mesh reply is posted as a real Discord reply with `failIfNotExists: false` and the same disabled mentions. The first mesh chunk of a Discord message is the canonical reply root, while every chunk maps back to that Discord message, so a mesh reply to any chunk threads onto the original. When the referenced message is unknown, expired, or deleted, the message is relayed unthreaded and `REPLY_TARGET_UNAVAILABLE` is emitted with only the direction and referenced id.
 
+Reaction additions are translated in both directions. A non-bot Discord reaction in the configured channel sends two sequential, independently retried ACK-requested mesh packets that reply to the target's canonical mesh id: first the native tapback, then `<tapback>[Display name]: Reacted with <original reaction>`. One Unicode base codepoint with optional U+FE0F is preserved exactly; custom emoji, skin tones, flags, ZWJ sequences, and other multi-codepoint reactions use `✳️`/U+2733 for the tapback while the reply names the original reaction (`:name:` for custom emoji). A mesh `TEXT_MESSAGE_APP` packet with nonzero `emoji` and `reply_id` becomes a native Discord reaction and is never posted as message text. Reaction packet ids alias to the same Discord target without replacing its canonical mesh root.
+
 A message that fits one mesh packet is formatted as `[Display name]: text`. Split messages use `[Display name]: (i/n) text` on every chunk. Chunks are split on whitespace where possible and otherwise at Unicode grapheme boundaries. Resolved mention text, brackets, attribution, and numbering all count against the 232-byte UTF-8 text ceiling: current firmware permits a 239-byte encoded `Data` envelope after the 16-byte radio header, and the text port plus required bitfield consume seven encoded bytes. Sends are paced, request ACKs, and use bounded retries. Queue rejection and partial/final delivery failures are reported to Discord and the TUI without repeating message content.
 
 Mesh → Discord accepts only decoded `TEXT_MESSAGE_APP` packets on the resolved channel. Broadcasts and direct messages are both forwarded; local-node echoes and bounded-TTL duplicates are suppressed. Output is `**[Mesh long name]:** text`, with Discord Markdown escaped inside the name and `Unknown !nodeid` used only when the radio has not supplied a long name. Mentions are disabled.
@@ -101,8 +104,9 @@ No message contents or secrets are written to the structured log. Message text e
 - **Missing configuration:** run `node dist\service.js` interactively; the fatal error names the missing/invalid variable.
 - **Zero or multiple Meshtastic radios:** connect exactly one configured radio and watch `npm run tui`; unrelated or locked USB serial ports are reported as rejected and retry is automatic.
 - **Channel failure:** correct the exact encrypted channel name on the radio and in `.env`, then restart the service.
-- **Discord failure:** confirm the bot is named `Mesh Bridge`, Message Content Intent is enabled, the channel ID is correct, and only View Channel + Send Messages + Read Message History are granted.
+- **Discord failure:** confirm the bot is named `Mesh Bridge`, Message Content Intent is enabled, the channel ID is correct, and only View Channel + Send Messages + Read Message History + Add Reactions are granted.
 - **Replies arrive unthreaded:** expected when the referenced message predates the service start or its correlation aged past `DEDUP_TTL_MS`, or when the Discord target was deleted. The bridge relays the text unthreaded and records `REPLY_TARGET_UNAVAILABLE` with only the direction and referenced id; no action is needed.
+- **Reaction reports 0/2 or 1/2:** the target correlation was unavailable or one or both ACK-requested mesh packets exhausted their retry budget. Check the sanitized TUI event and link state; re-add the reaction after the target has been bridged if needed.
 - **Service will not start:** inspect `logs\MeshBridge.wrapper.log` and `logs\mesh-bridge.jsonl`, then run `node dist\service.js` interactively after stopping the service.
 - **TUI cannot attach:** verify `IPC_TOKEN` and `IPC_PORT` match the service `.env`; only one service instance can own the port.
 
@@ -113,6 +117,7 @@ No message contents or secrets are written to the structured log. Message text e
 - The official core ACK timeout is 60 seconds. With the default two retries, a final radio failure can take about three minutes.
 - State, deduplication, reply correlation, names, and pending work are memory-only and reset on service restart. Replies to messages bridged before a restart relay unthreaded.
 - Reply correlation is bounded by `DEDUP_TTL_MS` and ten times `QUEUE_LIMIT` entries per direction; older correlations are evicted in insertion order and their replies relay unthreaded.
+- Discord reaction removals are intentionally ignored because the official Meshtastic core/protobuf API exposes no tapback-removal operation.
 - A node that has not advertised its long name uses `Unknown !nodeid` until NodeInfo arrives.
 
 ## Primary references

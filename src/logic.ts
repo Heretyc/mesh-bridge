@@ -39,11 +39,12 @@ export function resolveEncryptedChannel(channels: MeshChannelCandidate[], config
   return channel.index;
 }
 
-// Native replies need history access as well as the two forwarding permissions.
+// Native replies need history access and mesh tapbacks need reaction access, on top of the two forwarding permissions.
 export const REQUIRED_DISCORD_PERMISSIONS: readonly bigint[] = [
   PermissionFlagsBits.ViewChannel,
   PermissionFlagsBits.SendMessages,
   PermissionFlagsBits.ReadMessageHistory,
+  PermissionFlagsBits.AddReactions,
 ];
 
 export function hasRequiredDiscordPermissions(permissions: { has(bits: bigint[]): boolean } | null | undefined): boolean {
@@ -65,6 +66,103 @@ export function safeDisplayName(name: string): string {
 export function formatMeshForDiscord(longName: string, text: string): string {
   const escapedName = escapeMarkdown(safeDisplayName(longName)).replaceAll("[", "\\[").replaceAll("]", "\\]");
   return `**[${escapedName}]:** ${text}`;
+}
+
+export interface DiscordReactionRouteInput {
+  channelId: string;
+  reactorBot: boolean;
+}
+
+// Reactions are routed like messages: configured channel only, never from a bot. The bot test is also what
+// keeps the reactions this bridge adds for mesh tapbacks from looping straight back out to the mesh.
+export function shouldForwardDiscordReaction(input: DiscordReactionRouteInput, configuredChannelId: string): boolean {
+  return input.channelId === configuredChannelId && !input.reactorBot;
+}
+
+/** Stand-in tapback for every reaction the single-base-emoji tapback format cannot carry. */
+export const UNSUPPORTED_TAPBACK = "✳️";
+export const UNSUPPORTED_TAPBACK_CODEPOINT = 0x2733;
+const VARIATION_SELECTOR_16 = 0xfe0f;
+
+export interface DiscordReactionEmoji {
+  /** Custom emoji id, or null for a Unicode reaction. */
+  id: string | null;
+  /** The Unicode grapheme for a Unicode reaction, or the custom emoji's name. */
+  name: string | null;
+}
+
+export interface TapbackPlan {
+  /** Grapheme sent as the mesh tapback payload and repeated as the reply prefix. */
+  tapback: string;
+  /** Base codepoint carried in Data.emoji alongside the tapback payload. */
+  codepoint: number;
+  /** What the reactor actually picked, echoed verbatim in the reply text. */
+  display: string;
+  supported: boolean;
+}
+
+/**
+ * A Meshtastic tapback carries exactly one base emoji. A Unicode reaction qualifies only when it is a single
+ * base codepoint optionally followed by U+FE0F, and then its exact grapheme (VS16 included) is preserved.
+ * Custom, skin-toned, flag, ZWJ, and every other multi-codepoint reaction falls back to the stand-in tapback
+ * while the reply text still shows what the reactor picked.
+ */
+export function classifyDiscordReaction(emoji: DiscordReactionEmoji): TapbackPlan {
+  const unsupported = (display: string): TapbackPlan => ({
+    tapback: UNSUPPORTED_TAPBACK,
+    codepoint: UNSUPPORTED_TAPBACK_CODEPOINT,
+    display,
+    supported: false,
+  });
+  if (emoji.id !== null) return unsupported(`:${emoji.name ?? "emoji"}:`);
+  const name = emoji.name ?? "";
+  const points = [...name];
+  const base = points[0]?.codePointAt(0);
+  if (base === undefined) return unsupported(UNSUPPORTED_TAPBACK);
+  if (points.length > 2 || (points.length === 2 && points[1]!.codePointAt(0) !== VARIATION_SELECTOR_16)) {
+    return unsupported(name);
+  }
+  return { tapback: name, codepoint: base, display: name, supported: true };
+}
+
+/** The plain-text leg of a Discord reaction: `<tapback>[<display name>]: Reacted with <what was picked>`. */
+export function formatReactionForMesh(plan: TapbackPlan, displayName: string): string {
+  return `${plan.tapback}[${safeDisplayName(displayName)}]: Reacted with ${plan.display}`;
+}
+
+export interface MeshTapbackInput {
+  emoji: number;
+  replyId: number;
+}
+
+/** Firmware marks a tapback with a nonzero Data.emoji plus the reply id of the message being tapped. */
+export function isMeshTapback(input: MeshTapbackInput): boolean {
+  return input.emoji !== 0 && input.replyId !== 0;
+}
+
+function printableGrapheme(text: string): boolean {
+  return [...text].every((point) => {
+    const value = point.codePointAt(0)!;
+    return value >= 0x20 && value !== 0x7f;
+  });
+}
+
+/**
+ * Prefer the decoded payload so a VS16-qualified grapheme survives intact, and fall back to the Data.emoji
+ * codepoint only when the payload is empty or is not a plausible emoji grapheme. Returns undefined when
+ * neither source yields something that can be handed to the Discord reaction API.
+ */
+export function meshTapbackEmoji(payload: string, codepoint: number): string | undefined {
+  if (!Number.isInteger(codepoint) || codepoint < 0x20 || codepoint > 0x10ffff) return undefined;
+  if (codepoint >= 0xd800 && codepoint <= 0xdfff) return undefined;
+  const text = payload.trim();
+  const points = [...text];
+  if (
+    printableGrapheme(text)
+    && points[0]?.codePointAt(0) === codepoint
+    && (points.length === 1 || (points.length === 2 && points[1]!.codePointAt(0) === VARIATION_SELECTOR_16))
+  ) return text;
+  return String.fromCodePoint(codepoint);
 }
 
 export function safeAttachmentName(name: string): string {
@@ -257,6 +355,12 @@ export class ReplyCorrelator {
     if (meshPacketId === 0) return;
     this.discordIdByMeshId.set(meshPacketId, discordId, now);
     this.meshRootByDiscordId.set(discordId, meshPacketId, now);
+  }
+
+  /** Point an extra mesh packet id at an already-correlated Discord message, leaving that message's canonical mesh root alone. */
+  public aliasMeshPacket(meshPacketId: number, discordId: string, now?: number): void {
+    if (meshPacketId === 0) return;
+    this.discordIdByMeshId.set(meshPacketId, discordId, now);
   }
 }
 
