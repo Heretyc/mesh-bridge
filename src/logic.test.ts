@@ -82,7 +82,9 @@ test("UTF-8 chunks include stable numbering and attribution inside 233 bytes", (
     reconstructed.push(chunk.slice(marker.length));
   }
   assert.equal(reconstructed.join(""), body);
-  assert.equal(splitDiscordForMesh("A", "short")[0], "A: (1/1) short");
+  assert.equal(splitDiscordForMesh("A", "short")[0], "A: short");
+  assert.equal(Buffer.byteLength(splitDiscordForMesh("A", "x".repeat(230))[0]!, "utf8"), MESHTASTIC_TEXT_BYTES);
+  assert.match(splitDiscordForMesh("A", "x".repeat(231))[0]!, /^A: \(1\/2\) /u);
 });
 
 test("ACK retry is bounded and observable with a mock sender", async () => {

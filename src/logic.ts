@@ -92,7 +92,9 @@ function splitOnce(body: string, name: string, total: number): string[] {
 export function splitDiscordForMesh(displayName: string, body: string): string[] {
   if (!body) return [];
   const name = safeDisplayName(displayName);
-  let total = 1;
+  const single = `${name}: ${body}`;
+  if (byteLength(single) <= MESHTASTIC_TEXT_BYTES) return [single];
+  let total = 2;
   for (let pass = 0; pass < 20; pass += 1) {
     const pieces = splitOnce(body, name, total);
     if (pieces.length === total) return pieces.map((piece, index) => `${name}: (${index + 1}/${total}) ${piece}`);

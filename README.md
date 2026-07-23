@@ -79,7 +79,7 @@ The TUI shows link states, serial port, local node ID, resolved channel index, q
 
 Discord → Mesh accepts only ordinary user messages (including replies, but not referenced reply content) in `DISCORD_CHANNEL_ID`. Bots, webhooks, system messages, duplicate Discord IDs, embeds, stickers, and empty messages are ignored. Plain message text and URLs are unchanged; attachment URLs and bodies are ignored, while each safe filename and extension is appended.
 
-Every mesh packet is formatted as `Display name: (i/n) text`, including `(1/1)`. Chunks are split on whitespace where possible and otherwise at Unicode grapheme boundaries. Attribution and numbering count against the official 233-byte Meshtastic data-payload limit. Sends are paced, request ACKs, and use bounded retries. Queue rejection and partial/final delivery failures are reported to Discord and the TUI without repeating message content.
+A message that fits one mesh packet is formatted as `Display name: text`. Split messages use `Display name: (i/n) text` on every chunk. Chunks are split on whitespace where possible and otherwise at Unicode grapheme boundaries. Attribution and numbering count against the official 233-byte Meshtastic data-payload limit. Sends are paced, request ACKs, and use bounded retries. Queue rejection and partial/final delivery failures are reported to Discord and the TUI without repeating message content.
 
 Mesh → Discord accepts only decoded `TEXT_MESSAGE_APP` packets on the resolved channel. Broadcasts and direct messages are both forwarded; local-node echoes and bounded-TTL duplicates are suppressed. Output is `Mesh long name: text`, with `Unknown !nodeid` only when the radio has not supplied a long name. Mentions are disabled.
 
