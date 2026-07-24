@@ -104,7 +104,10 @@ Target SHA: <sha checked out for validation>
   SHA has `Status: pass`, or the owner explicitly approves an emergency override
   that names the risk and accepted bypass.
 - Human review must inspect the routine session URL or PR comment before merge
-  until Anthropic exposes a blocking completion status for routines.
+  until Anthropic exposes a blocking completion status for routines. The
+  solo-owner exact-SHA attestation defined in `git-collaboration.md` is the only
+  exception to a separate reviewer's approval when no second authorized human
+  exists; it never substitutes for the Routine report itself.
 - If the routine API, token, quota, or webhook delivery fails, the PR does not
   merge.
 - If direct GitHub-event routines are enabled in Claude, keep the workflow

@@ -25,6 +25,10 @@ read it first and treat it as the canonical hub.
 - Overflow rule: keep `AGENTS.md` a dense index — push detail into spec docs
   behind Load Triggers. Never halt for fit. Never create a unified
   rules/directives dump file.
+- Inline exception: the byte-identical Project Board Law and Historian content
+  policy blocks below are required always-loaded canonical material. They are
+  exempt from the dense-index and overflow placement rules and must not move
+  behind Load Triggers.
 
 ## Context Routing
 
@@ -202,15 +206,16 @@ https://github.com/users/Heretyc/projects/3 is the canonical Source of Truth
     BEFORE any board edit. Conflicts between Board and Premise resolve per Law 2.
 9. Net-new Work not on the board: HR BEFORE adding it. That HR also supplies the
     new issue's Iteration and other judgment fields (Law 4).
-10. Board ops use ONLY the `gh` CLI, including `gh api` where subcommands lack
-    field coverage (Relationships). If `gh` is not authenticated or lacks
-    the project scope: Action HR asking the human to run `gh auth refresh -s
+10. Board ops use ONLY the `gh` CLI (including `gh api`) or GitHub MCP. Either
+    channel may perform supported Board reads and mutations. If neither is
+    available, authenticated, or adequately scoped: Action HR asking the human
+    to enable one; `gh` project scope may be refreshed with `gh auth refresh -s
     project` (interactive; agents cannot complete it).
-11. Before starting Work on an unassigned issue, assign it to the logged-in `gh`
+11. Before starting Work on an unassigned issue, assign it to the authenticated GitHub
     user. If an issue you are tasked to work is assigned to someone else: Action
     HR to reassign. If the human declines, stand down from that item: you are
-    forbidden from performing Work on any issue not assigned to the logged-in
-    `gh` user. Idle issues may remain unassigned or assigned to others.
+    forbidden from performing Work on any issue not assigned to the authenticated
+    GitHub user. Idle issues may remain unassigned or assigned to others.
 12. Never store local paths or machine-specific information anywhere on the Board.
 13. Sweep the Board before starting and after finishing Work: find the most
     recently COMPLETED "Project Board true-up #". If it completed more than 5

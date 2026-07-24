@@ -54,6 +54,9 @@ Use this checklist for repository work. The normative policy is
   reviewer notes.
 - Do not merge draft, failing, conflicted, stale, superseded, unsafe, or
   under-reviewed PRs.
+- When no second authorized human exists, use only the solo-owner gate in the
+  full git SOP: exact-head owner attestation after an independent Routine pass;
+  an agent may then execute, but does not approve, the merge.
 
 ## GitHub Actions
 

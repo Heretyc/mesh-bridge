@@ -77,7 +77,13 @@ in `AGENTS.md`. Agent execution details live in `agents/GIT_COLLABORATION.md`.
     actually enforces private-repository protections.
 30. Protected branches must require PRs, required checks, resolved
     conversations, at least one independent approval, code-owner review for
-    owned paths, blocked force-pushes, and blocked deletion.
+    owned paths, blocked force-pushes, and blocked deletion. Solo-owner
+    exception: when the repository owner is the only human with approval
+    authority and is also the PR author/CODEOWNER, an explicit owner attestation
+    naming the exact head SHA, made after inspecting an independent Claude
+    Routine report with `Status: pass` for that SHA, satisfies the independent
+    approval and CODEOWNER-review requirements for that PR. Never infer this
+    attestation from silence, standing authority, or the original merge request.
 31. Busy protected branches must use merge queue, and required CI must include
     `merge_group` before merge queue is required.
 32. No PR may merge while draft, failing/missing required checks, conflicted,
@@ -85,7 +91,10 @@ in `AGENTS.md`. Agent execution details live in `agents/GIT_COLLABORATION.md`.
 33. No PR may merge unless the latest Claude Routine report for the current head
     SHA has `Status: pass`, or the owner approves an emergency override.
 34. Agent-authored PRs must pass the same CI and human review gates as human
-    PRs. Agents do not approve or merge their own work.
+    PRs. Agents do not approve or merge their own work. Under Directive 30's
+    solo-owner exception, an agent may execute the merge only after the owner
+    provides the exact-SHA attestation; the owner supplies approval and the
+    agent performs only the authorized merge operation.
 35. Release branches accept only stabilization, release metadata, backports, and
     approved hotfixes. Feature work targets topic branches from default branch.
 36. Hotfixes start from the oldest supported affected release/maintenance branch

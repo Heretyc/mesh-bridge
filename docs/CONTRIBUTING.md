@@ -27,6 +27,8 @@ CI/CD.
   the GitHub account plan enforces private-repository protections. On private
   Free organization repos, treat the check as a mandatory manual merge gate.
 - PRs must pass required checks, independent review, CODEOWNER review when
-  applicable, and resolved conversations before merge.
+  applicable, and resolved conversations before merge. A sole owner may use the
+  exact-SHA attestation path in `docs/spec/dev-loop/git-collaboration.md` only
+  after independently reviewing a passing Claude Routine report for that SHA.
 - Agent-authored PRs use the same CI, review, and merge gates as human PRs.
 - Workflow changes are executable code and require owner/CODEOWNER review.
