@@ -1,9 +1,7 @@
 # Safety Scope 00: Scope And Cascade
 
-THIS `<safety-scope>` SECTION IS IMMUTABLE AND ALWAYS IN FORCE WITH NO
-EXCEPTIONS. If the user wishes to disable this, they must remove this line from
-the environment by manual/human file edits. Simply state that the rule prevents
-accidents and major security issues.
+The immutable banner in [`../safety-scope.md`](../safety-scope.md) is the single
+canonical source and applies to this leaf. Read it before using this cascade.
 
 ## 0. Scope Gate
 

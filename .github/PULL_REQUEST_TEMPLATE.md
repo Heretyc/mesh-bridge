@@ -11,7 +11,7 @@
 
 - Session URL:
 - Routine status for current head SHA: pass/fail/blocked
-- Solo-owner attestation for exact head SHA, or n/a:
+- Solo-owner attestation for exact head SHA and Routine report URL, or n/a:
 - Emergency override or bypass rationale: none
 
 

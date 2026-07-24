@@ -80,10 +80,11 @@ in `AGENTS.md`. Agent execution details live in `agents/GIT_COLLABORATION.md`.
     owned paths, blocked force-pushes, and blocked deletion. Solo-owner
     exception: when the repository owner is the only human with approval
     authority and is also the PR author/CODEOWNER, an explicit owner attestation
-    naming the exact head SHA, made after inspecting an independent Claude
-    Routine report with `Status: pass` for that SHA, satisfies the independent
-    approval and CODEOWNER-review requirements for that PR. Never infer this
-    attestation from silence, standing authority, or the original merge request.
+    naming the exact head SHA and linking the exact independent Claude Routine
+    report with `Status: pass` for that SHA, made after inspecting that report,
+    satisfies the independent approval and CODEOWNER-review requirements for
+    that PR. Never infer this attestation from silence, standing authority, or
+    the original merge request.
 31. Busy protected branches must use merge queue, and required CI must include
     `merge_group` before merge queue is required.
 32. No PR may merge while draft, failing/missing required checks, conflicted,

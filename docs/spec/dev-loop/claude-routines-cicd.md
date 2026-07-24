@@ -107,7 +107,8 @@ Target SHA: <sha checked out for validation>
   until Anthropic exposes a blocking completion status for routines. The
   solo-owner exact-SHA attestation defined in `git-collaboration.md` is the only
   exception to a separate reviewer's approval when no second authorized human
-  exists; it never substitutes for the Routine report itself.
+  exists; it must link the exact passing Routine report and never substitutes
+  for that report itself.
 - If the routine API, token, quota, or webhook delivery fails, the PR does not
   merge.
 - If direct GitHub-event routines are enabled in Claude, keep the workflow
