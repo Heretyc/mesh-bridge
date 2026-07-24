@@ -19,6 +19,7 @@ import {
   resolveDiscordMentions,
   resolveEncryptedChannel,
   retry,
+  retryUntilDeadline,
   safeAttachmentName,
   shouldForwardDiscord,
   shouldForwardDiscordReaction,
@@ -223,6 +224,75 @@ test("ACK retry is bounded and observable with a mock sender", async () => {
     throw new Error("mock timeout");
   }, 1), /mock timeout/u);
   assert.equal(calls, 2);
+});
+
+test("retryUntilDeadline paces triplets and stops at the monotonic deadline without overrunning it", async () => {
+  const budget = { attemptsPerBatch: 3, batchPauseMs: 10_000, deadlineMs: 600_000 };
+
+  // A fake monotonic clock that advances only when the policy sleeps proves the triplet + 10s pacing.
+  let nowMs = 0;
+  const pauses: number[] = [];
+  const batchMarks: number[] = [];
+  let calls = 0;
+  await assert.rejects(retryUntilDeadline(async () => {
+    calls += 1;
+    throw new Error(`mock NACK ${calls}`);
+  }, budget, {
+    now: () => nowMs,
+    sleep: async (ms) => { pauses.push(ms); nowMs += ms; },
+  }, (attempt) => batchMarks.push(attempt)), /mock NACK/u);
+
+  // 600000ms / 10000ms pause = 60 triplets; the 60th's pause is skipped (would land on the deadline), so 180 attempts and 59 pauses.
+  assert.equal(calls, 180);
+  assert.equal(pauses.length, 59);
+  assert.ok(pauses.every((ms) => ms === 10_000));
+  assert.deepEqual(batchMarks, Array.from({ length: 59 }, (_, index) => (index + 1) * 3));
+});
+
+test("retryUntilDeadline checks the deadline before every attempt and hands each its remaining budget", async () => {
+  // The operation "spends" wall-clock, so the deadline can land mid-triplet, not just between triplets.
+  let now = 0;
+  const remainings: number[] = [];
+  const marks: number[] = [];
+  await assert.rejects(retryUntilDeadline((remaining) => {
+    remainings.push(remaining);
+    now += 25; // each attempt consumes 25ms, like an ACK timeout
+    return Promise.reject(new Error("nack"));
+  }, { attemptsPerBatch: 3, batchPauseMs: 0, deadlineMs: 100 }, {
+    now: () => now,
+    sleep: async (ms) => { now += ms; },
+  }, (attempt) => marks.push(attempt)), /nack/u);
+  // Attempts stop the moment now reaches 100 — no attempt starts past the deadline, and each remaining is clamped ≥ 0.
+  assert.deepEqual(remainings, [100, 75, 50, 25]);
+  assert.deepEqual(marks, [3]); // one triplet completed (pause taken) before the deadline was hit mid-second-triplet
+
+  // A single attempt that overruns its remaining budget is never followed by another, and never sleeps.
+  let slowNow = 0;
+  let slowCalls = 0;
+  await assert.rejects(retryUntilDeadline((remaining) => {
+    slowCalls += 1;
+    slowNow += remaining + 5; // overshoots the deadline
+    return Promise.reject(new Error("late"));
+  }, { attemptsPerBatch: 3, batchPauseMs: 10_000, deadlineMs: 1_000 }, {
+    now: () => slowNow,
+    sleep: async () => { throw new Error("must not sleep past the deadline"); },
+  }), /late/u);
+  assert.equal(slowCalls, 1);
+
+  // Success inside the first triplet returns immediately, with a positive remaining and no pause.
+  let attempts = 0;
+  const okPauses: number[] = [];
+  const result = await retryUntilDeadline(async (remaining) => {
+    attempts += 1;
+    assert.ok(remaining > 0);
+    if (attempts < 2) throw new Error("transient");
+    return 99;
+  }, { attemptsPerBatch: 3, batchPauseMs: 10_000, deadlineMs: 600_000 }, {
+    now: () => 0, sleep: async (ms) => { okPauses.push(ms); },
+  });
+  assert.equal(result, 99);
+  assert.equal(attempts, 2);
+  assert.deepEqual(okPauses, []);
 });
 
 test("TtlMap expires, refreshes on write, and evicts the oldest entry past capacity", () => {

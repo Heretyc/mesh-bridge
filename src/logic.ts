@@ -255,6 +255,63 @@ export async function retry<T>(operation: () => Promise<T>, retries: number, onR
   throw lastError;
 }
 
+/** Bounded retry policy for outbound mesh sends: immediate attempts per batch, a pause between batches, and a monotonic deadline. */
+export interface RetryBudget {
+  /** Immediate attempts made back-to-back before pausing. */
+  attemptsPerBatch: number;
+  /** Wall-clock pause after a failed batch before the next one, in ms. */
+  batchPauseMs: number;
+  /** Monotonic ceiling for the whole retry, measured from the first attempt, in ms. */
+  deadlineMs: number;
+}
+
+/** Up to three immediate attempts, then a ten-second pause before the next triplet, giving up after ten minutes. */
+export const OUTBOUND_RETRY: RetryBudget = { attemptsPerBatch: 3, batchPauseMs: 10_000, deadlineMs: 600_000 };
+
+/** A monotonic clock plus an (abortable) sleep, injected so the deadline is deterministic and testable without real time. */
+export interface RetryClock {
+  /** Monotonic milliseconds; must never move backwards so the deadline cannot be extended or cut short. */
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+}
+
+/**
+ * Retry `operation` in batches of immediate attempts separated by a fixed pause, giving up once a monotonic
+ * deadline is reached. The deadline is captured from `clock.now()` up front, so a wall-clock jump can neither
+ * shorten nor extend the budget. It is checked after every attempt (i.e. before starting the next one) and
+ * before every pause, so the loop cannot start work or sleep past the deadline. The one attempt that is
+ * already in flight can still run to its own completion, so each attempt is handed the remaining budget:
+ * `operation` may use it to cap an internal wait (e.g. an ACK timeout) and thereby settle by the deadline
+ * rather than overrunning it. The very first attempt always runs, even with a zero-length budget.
+ * Resolves on the first success; rejects with the last error at the deadline.
+ */
+export async function retryUntilDeadline<T>(
+  operation: (remainingMs: number) => Promise<T>,
+  budget: RetryBudget,
+  clock: RetryClock,
+  onRetry?: (attempt: number) => void,
+): Promise<T> {
+  const deadline = clock.now() + budget.deadlineMs;
+  let attempt = 0;
+  let lastError: unknown;
+  for (;;) {
+    try {
+      return await operation(Math.max(0, deadline - clock.now()));
+    } catch (error) {
+      lastError = error;
+      attempt += 1;
+    }
+    // Checked before the next attempt and before any pause: never start work or sleep past the deadline.
+    if (clock.now() >= deadline) break;
+    if (attempt % budget.attemptsPerBatch === 0) {
+      if (clock.now() + budget.batchPauseMs >= deadline) break;
+      onRetry?.(attempt);
+      await clock.sleep(budget.batchPauseMs);
+    }
+  }
+  throw lastError;
+}
+
 export function delay(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(signal.reason);
