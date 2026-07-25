@@ -6,3 +6,5 @@ logs/
 *.exe
 *.xml
 *.wrapper.log
+*.lnk
+.agents/
