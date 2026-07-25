@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import type { Config } from "./config.js";
 import { ReplyCorrelator, splitDiscordForMesh } from "./logic.js";
@@ -42,7 +45,10 @@ interface Internals {
   deliverDiscordReactionToMesh(job: ReactionJob): Promise<void>;
   deliverMeshTapbackToDiscord(job: MeshTapbackJob): Promise<void>;
   handleDiscordReaction(reaction: unknown, user: unknown): Promise<void>;
+  handleDiscordMessage(message: unknown): Promise<void>;
   handleMeshPacket(packet: unknown, session: unknown): void;
+  telemetry: { close(): void };
+  stateDir: string;
 }
 
 interface ReactionJob {
@@ -60,8 +66,18 @@ interface MeshTapbackJob {
 }
 
 function newService(t: TestContext, overrides: Partial<Config> = {}): Internals {
+  const previous = process.env.MESH_BRIDGE_STATE_DIR;
+  const stateDir = mkdtempSync(join(tmpdir(), "mesh-bridge-service-"));
+  process.env.MESH_BRIDGE_STATE_DIR = stateDir;
   const internals = new BridgeService({ ...config, ...overrides }) as unknown as Internals;
-  t.after(() => internals.abort.abort(new Error("test finished"))); // clears each send's 65s ACK timer
+  internals.stateDir = stateDir;
+  t.after(() => {
+    internals.telemetry.close();
+    internals.abort.abort(new Error("test finished")); // clears each send's 65s ACK timer
+    if (previous === undefined) delete process.env.MESH_BRIDGE_STATE_DIR;
+    else process.env.MESH_BRIDGE_STATE_DIR = previous;
+    rmSync(stateDir, { recursive: true, force: true });
+  });
   return internals;
 }
 
@@ -75,6 +91,25 @@ function meshSession(sendText: (...args: unknown[]) => Promise<number>) {
     channel: 3,
     localNode: 7,
     disconnected: new Promise<void>(() => undefined),
+  };
+}
+
+function discordMessage(id: string, content: string): unknown {
+  return {
+    id,
+    type: 0,
+    channelId: config.discordChannelId,
+    author: { bot: false, globalName: null, username: "Ada" },
+    member: { displayName: "Ada" },
+    webhookId: null,
+    content,
+    attachments: { map: () => [] },
+    mentions: {
+      members: { map: () => [] },
+      users: { map: () => [] },
+      roles: { map: () => [] },
+    },
+    reference: null,
   };
 }
 
@@ -112,6 +147,62 @@ const reactor = {
   globalName: "Global Name",
   username: "username",
 };
+
+test("service telemetry writes full traffic bodies to disk without leaking configured tokens or TUI details", async (t) => {
+  const internals = newService(t);
+  const sends: unknown[][] = [];
+  const reactions: string[] = [];
+  internals.mesh = meshSession(async (...args) => {
+    sends.push(args);
+    return 900 + sends.length;
+  });
+  internals.discordChannel = {
+    send: async (options) => ({ id: `discord-${String(options.content).length}`, reference: null }),
+    messages: { fetch: async () => ({ react: async (emoji) => { reactions.push(emoji); } }) },
+  };
+
+  await internals.handleDiscordMessage(discordMessage("discord-body", `discord visible ${config.discordToken}`));
+  await internals.deliverDiscordToMesh({ id: "chunk-body", chunks: [`chunk visible ${config.discordToken}`], replyToDiscordId: undefined });
+  internals.handleMeshPacket({
+    id: 700,
+    from: 42,
+    to: 0,
+    channel: 3,
+    rxTime: 1,
+    payloadVariant: {
+      case: "decoded",
+      value: {
+        portnum: 1,
+        payload: new TextEncoder().encode(`mesh visible ${config.ipcToken}`),
+        replyId: 0,
+        emoji: 0,
+      },
+    },
+  }, { channel: 3, localNode: 7 });
+  await internals.deliverMeshToDiscord({ from: 42, text: `discord post ${config.ipcToken}`, packetId: 701, replyId: 0 });
+  internals.replies.recordOutboundChunk("reaction-target", 0, 901);
+  await internals.deliverDiscordReactionToMesh({
+    targetDiscordId: "reaction-target",
+    displayName: "Reactor",
+    emoji: "heart",
+    targetBody: `target visible ${config.discordToken}`,
+  });
+  internals.replies.recordInbound(555, "tap-target");
+  await internals.deliverMeshTapbackToDiscord({ from: 42, emoji: "heart", packetId: 702, replyId: 555 });
+
+  assert.deepEqual(reactions, ["heart"]);
+  const text = readFileSync(join(internals.stateDir, "Logs", "telemetry.jsonl"), "utf8");
+  for (const expected of ["discord visible", "chunk visible", "mesh visible", "discord post", "Reactor reacted with heart", "target visible", "heart"]) {
+    assert.equal(text.includes(expected), true);
+  }
+  assert.equal(text.includes(config.discordToken), false);
+  assert.equal(text.includes(config.ipcToken), false);
+  const snapshot = JSON.stringify(internals.status.snapshot());
+  assert.equal(snapshot.includes("discord visible"), false);
+  assert.equal(snapshot.includes("mesh visible"), false);
+  assert.equal(snapshot.includes(config.discordToken), false);
+  assert.equal(snapshot.includes(config.ipcToken), false);
+});
 
 test("Discord to Mesh sends the mesh root only on a reply's first chunk and maps chunks only once ACKed", async (t) => {
   const internals = newService(t);

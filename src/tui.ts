@@ -25,6 +25,7 @@ function render(status: StatusSnapshot): void {
     `Serial: ${visible(connections.serialPort)}  Node: ${visible(connections.localNode)}  Channel index: ${visible(connections.meshChannel)}`,
     `Queues: Discord→Mesh ${status.queues.discordToMesh}  Mesh→Discord ${status.queues.meshToDiscord}`,
     `Counters: ${counters}`,
+    ...(status.logDegraded ? ["", "Telemetry log writes are degraded; relay traffic is still running."] : []),
     "",
     "Sanitized rolling events",
     ...events,

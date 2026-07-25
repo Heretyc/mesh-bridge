@@ -95,9 +95,11 @@ Mesh → Discord accepts only decoded `TEXT_MESSAGE_APP` packets on the resolved
 - USB serial discovery/configuration reconnects with backoff. A channel resolution error is fatal instead of falling back to another channel.
 - Both directions use bounded in-memory queues. Full queues increment rejection/failure counters and emit visible events; nothing is silently discarded.
 - Shutdown stops intake, drains queues for up to 15 seconds, disconnects both links, and closes IPC.
-- `logs\mesh-bridge.jsonl` is structured JSONL, rotates at 1 MiB with five copies, and redacts token/secret/content/message/text/payload/PSK/key fields. WinSW wrapper output is also under `logs\`.
+- Local telemetry is one OTel-shaped JSONL file named `telemetry.jsonl`: `%ProgramData%\Mesh Bridge\Logs` on Windows, `${XDG_STATE_HOME:-$HOME/.local/state}/mesh-bridge/logs` on Linux, and `$HOME/Library/Logs/Mesh Bridge` on macOS. `MESH_BRIDGE_STATE_DIR` overrides the root for tests and portable installs.
+- The telemetry file is local-only: there is no exporter, collector, HTTP endpoint, or new dependency. Full Discord and Mesh message bodies are written to disk, with exact `DISCORD_TOKEN` and `IPC_TOKEN` value redaction before write. The TUI and IPC snapshot stay sanitized and do not show message bodies.
+- There is exactly one active telemetry file. Startup and the daily local 02:00 prune atomically rewrite it to keep records from the last 24 hours, skip malformed lines, and allow near-48-hour physical retention. A telemetry filesystem failure never stops relay traffic; the TUI and stderr report the degraded state once and report recovery once.
 
-No message contents or secrets are written to the structured log. Message text exists only in bounded in-memory queues while being delivered.
+WinSW wrapper output remains under the Windows service wrapper log path.
 
 ## Recovery
 
@@ -107,7 +109,7 @@ No message contents or secrets are written to the structured log. Message text e
 - **Discord failure:** confirm the bot is named `Mesh Bridge`, Message Content Intent is enabled, the channel ID is correct, and only View Channel + Send Messages + Read Message History + Add Reactions are granted.
 - **Replies arrive unthreaded:** expected when the referenced message predates the service start or its correlation aged past `DEDUP_TTL_MS`, or when the Discord target was deleted. The bridge relays the text unthreaded and records `REPLY_TARGET_UNAVAILABLE` with only the direction and referenced id; no action is needed.
 - **Reaction reports 0/1:** the single ACK-requested reaction text exhausted its retry budget or could not fit safely. Check the sanitized TUI event and link state; an unavailable target mapping falls back to an unthreaded excerpt.
-- **Service will not start:** inspect `logs\MeshBridge.wrapper.log` and `logs\mesh-bridge.jsonl`, then run `node dist\service.js` interactively after stopping the service.
+- **Service will not start:** inspect the WinSW wrapper log and local `telemetry.jsonl`, then run `node dist\service.js` interactively after stopping the service.
 - **TUI cannot attach:** verify `IPC_TOKEN` and `IPC_PORT` match the service `.env`; only one service instance can own the port.
 
 ## Known limitations

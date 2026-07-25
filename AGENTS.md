@@ -81,6 +81,8 @@ read it first and treat it as the canonical hub.
   under `docs/spec`, skills, policy gates, CI/CD agent instructions, or text
   future agents/maintainers must follow. Do not read for one-off task notes,
   changelogs, or agent-state markdown unless they contain reusable rules.
+- `docs/spec/otel-logging.md`: read before changing on-disk log format,
+  redaction, retention/prune, or state-dir resolution.
 - `docs/spec/safety-scope/00-scope-and-cascade.md`: read when determining
   whether the clarifying-question cascade applies to the current turn or
   whether the session is automated.

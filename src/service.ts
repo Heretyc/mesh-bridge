@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { hostname } from "node:os";
+import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Constants, MeshDevice, Protobuf, Types } from "@meshtastic/core";
 import { TransportNodeSerial } from "@meshtastic/transport-node-serial";
@@ -44,7 +46,9 @@ import {
   splitDiscordForMesh,
   visibleDiscordReactionTarget,
 } from "./logic.js";
+import { logDir } from "./paths.js";
 import { IpcServer, StatusStore } from "./status.js";
+import { TelemetrySink } from "./telemetry.js";
 
 class FatalConfigurationError extends Error {}
 
@@ -140,10 +144,30 @@ export class BridgeService {
   private discord: Client | undefined;
   private discordChannel: SendableChannels | undefined;
   private mesh: MeshSession | undefined;
+  private readonly telemetry: TelemetrySink;
   private lastMeshSend = 0;
 
   public constructor(private readonly config: Config) {
     this.ipc = new IpcServer(config.ipcPort, config.ipcToken, this.status);
+    this.telemetry = new TelemetrySink({
+      logFile: join(logDir(), "telemetry.jsonl"),
+      secrets: [config.discordToken, config.ipcToken],
+      resource: {
+        "service.name": "mesh-bridge",
+        "service.version": "1.0.0",
+        "os.type": process.platform === "win32" ? "windows" : process.platform,
+        "host.name": hostname(),
+      },
+      onWriteError: (error) => {
+        this.status.logDegraded(true, "LOG_WRITE_FAILED", { error: String(error) });
+        process.stderr.write("[Mesh Bridge] warning: telemetry log writes failed; continuing without disk telemetry\n");
+      },
+      onWriteRecovered: () => {
+        this.status.logDegraded(false, "LOG_WRITE_RECOVERED");
+        process.stderr.write("[Mesh Bridge] notice: telemetry log writes recovered\n");
+      },
+    });
+    this.status.useTelemetry(this.telemetry);
     this.discordDedup = new TtlDedup(config.dedupTtlMs, config.queueLimit * 10);
     this.meshDedup = new TtlDedup(config.dedupTtlMs, config.queueLimit * 10);
     this.replies = new ReplyCorrelator(
@@ -294,6 +318,7 @@ export class BridgeService {
     if (this.discordDedup.seen(`discord:${message.id}`)) return;
 
     this.status.count("discordReceived");
+    this.telemetry.logMessageBody("discord->mesh", body, { discordId: message.id });
     const displayName = message.member?.displayName ?? message.author.globalName ?? message.author.username;
     const job: DiscordJob = {
       id: message.id,
@@ -369,6 +394,7 @@ export class BridgeService {
         this.replies.recordOutboundChunk(job.id, index, packetId);
         delivered += 1;
         this.status.count("meshSent");
+        this.telemetry.logMessageBody("discord->mesh", chunk, { discordId: job.id, chunk: index + 1, packetId });
       } catch (error) {
         if (this.abort.signal.aborted) return;
         this.status.count("failures");
@@ -415,6 +441,7 @@ export class BridgeService {
       });
       this.replies.aliasMeshPacket(packetId, job.targetDiscordId);
       this.status.count("meshSent");
+      this.telemetry.logMessageBody("discord->mesh.reaction", text, { referencedId: job.targetDiscordId, targetBody: job.targetBody, packetId });
     } catch {
       if (this.abort.signal.aborted) return;
       this.status.count("failures");
@@ -605,6 +632,7 @@ export class BridgeService {
       }
       return;
     }
+    this.telemetry.logMessageBody("mesh->discord", text, { from: packet.from, packetId: packet.id, replyId: data.replyId });
     if (!this.meshToDiscord.enqueue({ from: packet.from, text, packetId: packet.id, replyId: data.replyId })) {
       this.status.count("rejected");
       this.status.event("error", "MESH_TO_DISCORD_QUEUE_FULL", { from: packet.from, packetId: packet.id });
@@ -619,8 +647,9 @@ export class BridgeService {
       this.status.event("warn", "REPLY_TARGET_UNAVAILABLE", { direction: "meshToDiscord", referencedId: job.replyId });
     }
     try {
+      const content = formatMeshForDiscord(name, job.text);
       const sent = await channel.send({
-        content: formatMeshForDiscord(name, job.text),
+        content,
         allowedMentions,
         ...(target === undefined ? {} : { reply: { messageReference: target, failIfNotExists: false } }),
       });
@@ -630,6 +659,7 @@ export class BridgeService {
       }
       this.replies.recordInbound(job.packetId, sent.id);
       this.status.count("discordSent");
+      this.telemetry.logMessageBody("mesh->discord", content, { from: job.from, packetId: job.packetId, discordId: sent.id });
     } catch (error) {
       if (this.abort.signal.aborted) return;
       this.status.count("failures");
@@ -651,6 +681,7 @@ export class BridgeService {
       const message = await channel.messages.fetch(target);
       await message.react(job.emoji);
       this.status.count("discordSent");
+      this.telemetry.logMessageBody("mesh->discord.reaction", job.emoji, { from: job.from, packetId: job.packetId, referencedId: job.replyId, discordId: target });
     } catch {
       if (this.abort.signal.aborted) return;
       this.status.count("failures");
@@ -684,6 +715,7 @@ export class BridgeService {
     this.discord?.destroy();
     await this.mesh?.close().catch(() => undefined);
     await this.ipc.close();
+    this.telemetry.close();
   }
 }
 

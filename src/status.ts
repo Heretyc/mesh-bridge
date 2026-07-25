@@ -1,8 +1,7 @@
 import { EventEmitter } from "node:events";
-import { appendFileSync, existsSync, mkdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
-import { resolve } from "node:path";
 import { timingSafeEqual } from "node:crypto";
+import type { TelemetrySink } from "./telemetry.js";
 
 type LinkState = "offline" | "connecting" | "online" | "error";
 type Level = "info" | "warn" | "error";
@@ -25,6 +24,7 @@ export interface StatusSnapshot {
   };
   counters: Record<string, number>;
   queues: { discordToMesh: number; meshToDiscord: number };
+  logDegraded: boolean;
   events: EventLine[];
 }
 
@@ -39,40 +39,20 @@ export function redact(value: unknown, key = ""): unknown {
   return typeof value === "string" ? value.replace(/[\u0000-\u001f\u007f]/gu, " ").slice(0, 500) : value;
 }
 
-class RotatingJsonLog {
-  private readonly directory = resolve("logs");
-  private readonly path = resolve(this.directory, "mesh-bridge.jsonl");
-
-  public constructor(private readonly maxBytes = 1_048_576, private readonly copies = 5) {
-    mkdirSync(this.directory, { recursive: true });
-  }
-
-  public write(level: Level, code: string, meta: Record<string, unknown>): void {
-    const line = `${JSON.stringify({ at: new Date().toISOString(), level, code, meta: redact(meta) })}\n`;
-    if (existsSync(this.path) && statSync(this.path).size + Buffer.byteLength(line) > this.maxBytes) this.rotate();
-    appendFileSync(this.path, line, { encoding: "utf8", mode: 0o600 });
-  }
-
-  private rotate(): void {
-    const oldest = `${this.path}.${this.copies}`;
-    if (existsSync(oldest)) rmSync(oldest);
-    for (let index = this.copies - 1; index >= 1; index -= 1) {
-      const source = `${this.path}.${index}`;
-      if (existsSync(source)) renameSync(source, `${this.path}.${index + 1}`);
-    }
-    renameSync(this.path, `${this.path}.1`);
-  }
-}
-
 export class StatusStore extends EventEmitter {
-  private readonly log = new RotatingJsonLog();
+  private telemetry?: TelemetrySink;
   private readonly state: StatusSnapshot = {
     startedAt: new Date().toISOString(),
     connections: { discord: "offline", meshtastic: "offline", serialPort: "-", localNode: "-", meshChannel: "-" },
     counters: { discordReceived: 0, meshSent: 0, meshReceived: 0, discordSent: 0, retries: 0, failures: 0, rejected: 0 },
     queues: { discordToMesh: 0, meshToDiscord: 0 },
+    logDegraded: false,
     events: [],
   };
+
+  public useTelemetry(sink: TelemetrySink): void {
+    this.telemetry = sink;
+  }
 
   public snapshot(): StatusSnapshot {
     return structuredClone(this.state);
@@ -99,11 +79,21 @@ export class StatusStore extends EventEmitter {
   }
 
   public event(level: Level, code: string, meta: Record<string, unknown> = {}): void {
+    this.pushEvent(level, code, meta);
+    this.telemetry?.logEvent(level, code, meta);
+    this.changed();
+  }
+
+  public logDegraded(degraded: boolean, code: string, meta: Record<string, unknown> = {}): void {
+    this.state.logDegraded = degraded;
+    this.pushEvent(degraded ? "warn" : "info", code, meta);
+    this.changed();
+  }
+
+  private pushEvent(level: Level, code: string, meta: Record<string, unknown>): void {
     const safe = redact(meta) as Record<string, unknown>;
     this.state.events.push({ at: new Date().toISOString(), level, code, detail: Object.keys(safe).length ? JSON.stringify(safe) : "" });
     if (this.state.events.length > 25) this.state.events.shift();
-    this.log.write(level, code, meta);
-    this.changed();
   }
 
   private changed(): void {
