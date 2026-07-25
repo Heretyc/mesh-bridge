@@ -31,13 +31,10 @@ import {
   hasRequiredDiscordPermissions,
   isMeshTapback,
   meshTapbackEmoji,
-  OUTBOUND_RETRY,
   replyIdForChunk,
   resolveDiscordMentions,
   resolveEncryptedChannel,
-  retryUntilDeadline,
-  type RetryBudget,
-  type RetryClock,
+  retry,
   safeAttachmentName,
   safeDisplayName,
   shouldForwardDiscord,
@@ -134,12 +131,6 @@ export class BridgeService {
   private discordChannel: SendableChannels | undefined;
   private mesh: MeshSession | undefined;
   private lastMeshSend = 0;
-  // Monotonic clock + abortable sleep back the outbound retry deadline; overridable so tests stay deterministic and fast.
-  private readonly clock: RetryClock = {
-    now: () => performance.now(),
-    sleep: (ms) => delay(ms, this.abort.signal),
-  };
-  private readonly outboundRetry: RetryBudget = OUTBOUND_RETRY;
 
   public constructor(private readonly config: Config) {
     this.ipc = new IpcServer(config.ipcPort, config.ipcToken, this.status);
@@ -308,6 +299,7 @@ export class BridgeService {
     if (!this.discordToMesh.enqueue(job)) {
       this.status.count("rejected");
       this.status.event("error", "DISCORD_TO_MESH_QUEUE_FULL", { discordId: message.id });
+      await this.reportDiscord("Mesh Bridge: message was not queued because the mesh queue is full.");
     }
   }
 
@@ -340,6 +332,7 @@ export class BridgeService {
     if (!this.discordToMesh.enqueue(job)) {
       this.status.count("rejected");
       this.status.event("error", "DISCORD_TO_MESH_QUEUE_FULL", { kind: "reaction", referencedId: message.id });
+      await this.reportDiscord("Mesh Bridge: reaction was not queued because the mesh queue is full.");
     }
   }
 
@@ -353,15 +346,15 @@ export class BridgeService {
     // The loop index, not the delivered count, decides the reply root: chunk 1 is the only chunk that quotes it.
     for (const [index, chunk] of job.chunks.entries()) {
       try {
-        const packetId = await retryUntilDeadline(async (remainingMs) => {
+        const packetId = await retry(async () => {
           const session = await this.waitForMesh();
           await this.waitForMeshSendSlot();
           return Promise.race([
             session.device.sendText(chunk, "broadcast", true, session.channel as Types.ChannelNumber, replyIdForChunk(index, meshRoot)),
             session.disconnected.then<never>(() => Promise.reject(new Error("Meshtastic disconnected before ACK"))),
-            delay(Math.min(65_000, remainingMs), this.abort.signal).then<never>(() => Promise.reject(new Error("Meshtastic ACK timeout"))),
+            delay(65_000, this.abort.signal).then<never>(() => Promise.reject(new Error("Meshtastic ACK timeout"))),
           ]);
-        }, this.outboundRetry, this.clock, () => {
+        }, this.config.ackRetries, () => {
           this.status.count("retries");
           this.status.event("warn", "MESH_SEND_RETRY", { discordId: job.id, chunk: index + 1 });
         });
@@ -378,6 +371,8 @@ export class BridgeService {
           total: job.chunks.length,
           reason: reason(error),
         });
+        const kind = delivered === 0 ? "failed" : "partially failed";
+        await this.reportDiscord(`Mesh Bridge: mesh delivery ${kind}; ${delivered}/${job.chunks.length} chunks acknowledged.`);
         return;
       }
     }
@@ -389,6 +384,7 @@ export class BridgeService {
     if (meshRoot === undefined) {
       this.status.count("failures");
       this.status.event("error", "MESH_REACTION_TARGET_UNAVAILABLE", { direction: "discordToMesh", referencedId: job.targetDiscordId });
+      await this.reportDiscord("Mesh Bridge: reaction delivery failed; 0/2 packets acknowledged.");
       return;
     }
 
@@ -398,7 +394,7 @@ export class BridgeService {
       { text: job.replyText, emoji: undefined },
     ].entries()) {
       try {
-        const packetId = await retryUntilDeadline(async (remainingMs) => {
+        const packetId = await retry(async () => {
           const session = await this.waitForMesh();
           await this.waitForMeshSendSlot();
           const send = leg.emoji === undefined
@@ -407,9 +403,9 @@ export class BridgeService {
           return Promise.race([
             send,
             session.disconnected.then<never>(() => Promise.reject(new Error("Meshtastic disconnected before ACK"))),
-            delay(Math.min(65_000, remainingMs), this.abort.signal).then<never>(() => Promise.reject(new Error("Meshtastic ACK timeout"))),
+            delay(65_000, this.abort.signal).then<never>(() => Promise.reject(new Error("Meshtastic ACK timeout"))),
           ]);
-        }, this.outboundRetry, this.clock, () => {
+        }, this.config.ackRetries, () => {
           this.status.count("retries");
           this.status.event("warn", "MESH_REACTION_SEND_RETRY", { leg: index + 1 });
         });
@@ -429,6 +425,7 @@ export class BridgeService {
         delivered,
         total: 2,
       });
+      await this.reportDiscord(`Mesh Bridge: reaction delivery ${delivered === 0 ? "failed" : "partially failed"}; ${delivered}/2 packets acknowledged.`);
     }
   }
 
@@ -675,6 +672,15 @@ export class BridgeService {
   private async waitForDiscord(): Promise<SendableChannels> {
     while (!this.discordChannel) await delay(250, this.abort.signal);
     return this.discordChannel;
+  }
+
+  private async reportDiscord(content: string): Promise<void> {
+    try {
+      const channel = await this.waitForDiscord();
+      await channel.send({ content, allowedMentions });
+    } catch (error) {
+      if (!this.abort.signal.aborted) this.status.event("error", "FAILURE_REPORT_UNDELIVERED");
+    }
   }
 
   private async shutdown(): Promise<void> {

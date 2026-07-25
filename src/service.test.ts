@@ -22,8 +22,6 @@ interface Internals {
   status: StatusStore;
   replies: ReplyCorrelator;
   abort: AbortController;
-  outboundRetry: { attemptsPerBatch: number; batchPauseMs: number; deadlineMs: number };
-  clock: { now: () => number; sleep: (ms: number) => Promise<void> };
   discordToMesh: {
     start(worker: (job: ReactionJob) => Promise<void>): void;
     drain(timeoutMs: number): Promise<boolean>;
@@ -406,35 +404,26 @@ test("Discord reaction resolves partial users before routing and ignores bot and
   assert.equal(sends[1]![0], "😀[Fetched Nick]: Reacted with 😀");
 });
 
-test("failed outbound sends are logged only — never announced into Discord — and stay bounded by the retry deadline", async (t) => {
-  await t.test("uncorrelated reaction logs a failure and sends no notice", async (subtest) => {
+test("uncorrelated Discord reaction reports 0/2, and first-leg failure still attempts the reply without logging content", async (t) => {
+  await t.test("uncorrelated", async (subtest) => {
     const internals = newService(subtest);
-    const notices: string[] = [];
+    const reports: string[] = [];
     internals.discordChannel = {
       send: async (options) => {
-        notices.push(String(options.content));
-        return { id: "notice", reference: null };
+        reports.push(String(options.content));
+        return { id: "report", reference: null };
       },
     };
     internals.discordToMesh.start((job) => internals.deliverOutbound(job));
     await internals.handleDiscordReaction(reaction("unknown-target", { id: null, name: "😀" }), reactor);
     assert.equal(await internals.discordToMesh.drain(1_000), true);
-
-    // The failure is recorded as an event only; no notice is ever printed back into Discord.
-    assert.deepEqual(notices, []);
-    const snapshot = internals.status.snapshot();
-    assert.equal(snapshot.counters.failures, 1);
-    assert.ok(snapshot.events.some((event) => event.code === "MESH_REACTION_TARGET_UNAVAILABLE"));
+    assert.deepEqual(reports, ["Mesh Bridge: reaction delivery failed; 0/2 packets acknowledged."]);
   });
 
-  await t.test("first-leg failure runs one bounded triplet, still sends the reply, and prints no notice", async (subtest) => {
-    // A fixed fake clock plus deadlineMs == batchPauseMs => one immediate triplet, then the pre-pause deadline
-    // check stops before sleeping, so an always-failing leg can never loop for real time.
-    const internals = newService(subtest);
-    internals.clock = { now: () => 0, sleep: async () => undefined };
-    internals.outboundRetry = { attemptsPerBatch: 3, batchPauseMs: 10_000, deadlineMs: 10_000 };
+  await t.test("first leg failure", async (subtest) => {
+    const internals = newService(subtest, { ackRetries: 2 });
     const sends: unknown[][] = [];
-    const notices: string[] = [];
+    const reports: string[] = [];
     internals.replies.recordOutboundChunk("target", 0, 900);
     internals.mesh = meshSession(async (...args) => {
       sends.push(args);
@@ -443,8 +432,8 @@ test("failed outbound sends are logged only — never announced into Discord —
     });
     internals.discordChannel = {
       send: async (options) => {
-        notices.push(String(options.content));
-        return { id: "notice", reference: null };
+        reports.push(String(options.content));
+        return { id: "report", reference: null };
       },
     };
     await internals.deliverDiscordReactionToMesh({
@@ -453,16 +442,17 @@ test("failed outbound sends are logged only — never announced into Discord —
       replyText: "secret reaction content",
     });
 
-    // One triplet of the failing tapback leg (attemptsPerBatch = 3), then the reply leg still goes out exactly once.
     assert.deepEqual(sends, [
       ["❤️", "broadcast", true, 3, 900, 1],
       ["❤️", "broadcast", true, 3, 900, 1],
       ["❤️", "broadcast", true, 3, 900, 1],
       ["secret reaction content", "broadcast", true, 3, 900],
     ]);
-    assert.deepEqual(notices, []); // failure is logged, never announced
+    assert.deepEqual(reports, ["Mesh Bridge: reaction delivery partially failed; 1/2 packets acknowledged."]);
     const snapshot = internals.status.snapshot();
     assert.deepEqual(snapshot.events.map(({ level, code, detail }) => ({ level, code, detail })), [
+      { level: "warn", code: "MESH_REACTION_SEND_RETRY", detail: '{"leg":1}' },
+      { level: "warn", code: "MESH_REACTION_SEND_RETRY", detail: '{"leg":1}' },
       { level: "error", code: "MESH_REACTION_DELIVERY_PARTIAL", detail: '{"delivered":1,"total":2}' },
     ]);
     assert.ok(snapshot.events.every((event) => !event.detail.includes("secret reaction content")));
