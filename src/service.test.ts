@@ -47,8 +47,9 @@ interface Internals {
 
 interface ReactionJob {
   targetDiscordId: string;
-  tapback: string;
-  replyText: string;
+  displayName: string;
+  emoji: string;
+  targetBody: string;
 }
 
 interface MeshTapbackJob {
@@ -81,6 +82,8 @@ function reaction(
   targetDiscordId: string,
   emoji: { id: string | null; name: string | null },
   displayName = "Server Nick",
+  content = "target body",
+  bridgeAuthored = false,
 ): unknown {
   return {
     partial: false,
@@ -90,6 +93,14 @@ function reaction(
       id: targetDiscordId,
       channelId: config.discordChannelId,
       guild: { members: { fetch: async () => ({ displayName }) } },
+      author: { bot: bridgeAuthored, username: bridgeAuthored ? "Mesh Bridge" : "target-user" },
+      content,
+      attachments: { map: () => [] },
+      mentions: {
+        members: { map: () => [] },
+        users: { map: () => [] },
+        roles: { map: () => [] },
+      },
     },
   };
 }
@@ -288,26 +299,20 @@ test("mesh tapback target and REST failures are counted and never log payload co
   assert.equal(internals.replies.discordTargetFor(702), "deleted-target");
 });
 
-test("supported and custom Discord reactions produce exact ordered tapback and reply packets", async (t) => {
+test("mapped Unicode and custom Discord reactions send exact five-argument reply text", async (t) => {
   for (const fixture of [
     {
       target: "discord-origin",
       root: 500,
       emoji: { id: null, name: "❤️" },
-      expected: [
-        ["❤️", "broadcast", true, 3, 500, 1],
-        ["❤️[Server Nick]: Reacted with ❤️", "broadcast", true, 3, 500],
-      ],
+      expected: [["Server Nick reacted with ❤️", "broadcast", true, 3, 500]],
       correlate: (internals: Internals) => internals.replies.recordOutboundChunk("discord-origin", 0, 500),
     },
     {
       target: "bridge-bot-post",
       root: 600,
       emoji: { id: "custom-id", name: "lol" },
-      expected: [
-        ["✳️", "broadcast", true, 3, 600, 1],
-        ["✳️[Server Nick]: Reacted with :lol:", "broadcast", true, 3, 600],
-      ],
+      expected: [["Server Nick reacted with :lol:", "broadcast", true, 3, 600]],
       correlate: (internals: Internals) => internals.replies.recordInbound(600, "bridge-bot-post"),
     },
   ]) {
@@ -325,9 +330,9 @@ test("supported and custom Discord reactions produce exact ordered tapback and r
       assert.equal(await internals.discordToMesh.drain(1_000), true);
 
       assert.deepEqual(sends, fixture.expected);
+      assert.equal(sends[0]!.length, 5);
       assert.equal(internals.replies.meshRootFor(fixture.target), fixture.root);
       assert.equal(internals.replies.discordTargetFor(fixture.root + 1), fixture.target);
-      assert.equal(internals.replies.discordTargetFor(fixture.root + 2), fixture.target);
     });
   }
 });
@@ -400,12 +405,29 @@ test("Discord reaction resolves partial users before routing and ignores bot and
   assert.equal(partialFetches, 3);
   assert.equal(botReactionFetches, 0);
   assert.deepEqual(fetchOrder, ["bot-user", "user", "reaction", "message"]);
-  assert.equal(sends.length, 2);
-  assert.equal(sends[1]![0], "😀[Fetched Nick]: Reacted with 😀");
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0]![0], "Fetched Nick reacted with 😀");
 });
 
-test("uncorrelated Discord reaction reports 0/2, and first-leg failure still attempts the reply without logging content", async (t) => {
-  await t.test("uncorrelated", async (subtest) => {
+test("uncorrelated Discord reaction sends one unthreaded excerpt packet", async (t) => {
+  const internals = newService(t);
+  const sends: unknown[][] = [];
+  internals.mesh = meshSession(async (...args) => {
+    sends.push(args);
+    return 901;
+  });
+  internals.discordToMesh.start((job) => internals.deliverOutbound(job));
+  await internals.handleDiscordReaction(
+    reaction("unknown-target", { id: null, name: "😀" }, "Server Nick", "**[Xandi]:** hello", true),
+    reactor,
+  );
+  assert.equal(await internals.discordToMesh.drain(1_000), true);
+  assert.deepEqual(sends, [['Server Nick reacted 😀 to "[Xandi]: hello"', "broadcast", true, 3, undefined]]);
+  assert.equal(sends[0]!.length, 5);
+});
+
+test("empty uncorrelated target and ACK exhaustion fail clearly as 0/1", async (t) => {
+  await t.test("empty target", async (subtest) => {
     const internals = newService(subtest);
     const reports: string[] = [];
     internals.discordChannel = {
@@ -415,20 +437,20 @@ test("uncorrelated Discord reaction reports 0/2, and first-leg failure still att
       },
     };
     internals.discordToMesh.start((job) => internals.deliverOutbound(job));
-    await internals.handleDiscordReaction(reaction("unknown-target", { id: null, name: "😀" }), reactor);
+    await internals.handleDiscordReaction(reaction("unknown-target", { id: null, name: "😀" }, "Server Nick", ""), reactor);
     assert.equal(await internals.discordToMesh.drain(1_000), true);
-    assert.deepEqual(reports, ["Mesh Bridge: reaction delivery failed; 0/2 packets acknowledged."]);
+    assert.deepEqual(reports, ["Mesh Bridge: reaction delivery failed; 0/1 packets acknowledged."]);
+    assert.ok(internals.status.snapshot().events.some((event) => event.code === "MESH_REACTION_FORMAT_FAILED"));
   });
 
-  await t.test("first leg failure", async (subtest) => {
+  await t.test("ACK exhaustion", async (subtest) => {
     const internals = newService(subtest, { ackRetries: 2 });
     const sends: unknown[][] = [];
     const reports: string[] = [];
     internals.replies.recordOutboundChunk("target", 0, 900);
     internals.mesh = meshSession(async (...args) => {
       sends.push(args);
-      if (args.length === 6) throw new Error("secret reaction content");
-      return 902;
+      throw new Error("secret reaction content");
     });
     internals.discordChannel = {
       send: async (options) => {
@@ -438,22 +460,23 @@ test("uncorrelated Discord reaction reports 0/2, and first-leg failure still att
     };
     await internals.deliverDiscordReactionToMesh({
       targetDiscordId: "target",
-      tapback: "❤️",
-      replyText: "secret reaction content",
+      displayName: "Secret Reactor",
+      emoji: "❤️",
+      targetBody: "secret reaction content",
     });
 
     assert.deepEqual(sends, [
-      ["❤️", "broadcast", true, 3, 900, 1],
-      ["❤️", "broadcast", true, 3, 900, 1],
-      ["❤️", "broadcast", true, 3, 900, 1],
-      ["secret reaction content", "broadcast", true, 3, 900],
+      ["Secret Reactor reacted with ❤️", "broadcast", true, 3, 900],
+      ["Secret Reactor reacted with ❤️", "broadcast", true, 3, 900],
+      ["Secret Reactor reacted with ❤️", "broadcast", true, 3, 900],
     ]);
-    assert.deepEqual(reports, ["Mesh Bridge: reaction delivery partially failed; 1/2 packets acknowledged."]);
+    assert.ok(sends.every((args) => args.length === 5));
+    assert.deepEqual(reports, ["Mesh Bridge: reaction delivery failed; 0/1 packets acknowledged."]);
     const snapshot = internals.status.snapshot();
     assert.deepEqual(snapshot.events.map(({ level, code, detail }) => ({ level, code, detail })), [
-      { level: "warn", code: "MESH_REACTION_SEND_RETRY", detail: '{"leg":1}' },
-      { level: "warn", code: "MESH_REACTION_SEND_RETRY", detail: '{"leg":1}' },
-      { level: "error", code: "MESH_REACTION_DELIVERY_PARTIAL", detail: '{"delivered":1,"total":2}' },
+      { level: "warn", code: "MESH_REACTION_SEND_RETRY", detail: '{"referencedId":"target","attempt":1}' },
+      { level: "warn", code: "MESH_REACTION_SEND_RETRY", detail: '{"referencedId":"target","attempt":2}' },
+      { level: "error", code: "MESH_REACTION_DELIVERY_FAILED", detail: '{"delivered":0,"total":1}' },
     ]);
     assert.ok(snapshot.events.every((event) => !event.detail.includes("secret reaction content")));
   });

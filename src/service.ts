@@ -23,11 +23,12 @@ import {
   TtlDedup,
   TtlMap,
   backoff,
-  classifyDiscordReaction,
   delay,
+  discordReactionDisplay,
   discoverMeshtasticPath,
+  formatMappedReactionForMesh,
   formatMeshForDiscord,
-  formatReactionForMesh,
+  formatUnmappedReactionForMesh,
   hasRequiredDiscordPermissions,
   isMeshTapback,
   meshTapbackEmoji,
@@ -41,6 +42,7 @@ import {
   shouldForwardDiscordReaction,
   shouldForwardMesh,
   splitDiscordForMesh,
+  visibleDiscordReactionTarget,
 } from "./logic.js";
 import { IpcServer, StatusStore } from "./status.js";
 
@@ -54,12 +56,10 @@ interface DiscordJob {
 }
 
 interface DiscordReactionJob {
-  /** Discord message the reaction targets; ACKed packet ids alias back onto it. */
   targetDiscordId: string;
-  /** Grapheme sent as the native tapback payload. */
-  tapback: string;
-  /** Ordinary reply text sent after the tapback so clients without tapback rendering still see the reaction. */
-  replyText: string;
+  displayName: string;
+  emoji: string;
+  targetBody: string;
 }
 
 /** Messages and reactions share one outbound queue so global send order, pacing, and ACK retries stay single-threaded. */
@@ -92,6 +92,16 @@ interface MeshSession {
 }
 
 const allowedMentions = { parse: [] as never[], repliedUser: false };
+
+function discordMessageBody(message: Message): string {
+  const attachmentNames = message.attachments.map((attachment) => safeAttachmentName(attachment.name));
+  const mentionNames = {
+    members: new Map(message.mentions.members?.map((member) => [member.id, member.displayName] as const) ?? []),
+    users: new Map(message.mentions.users.map((user) => [user.id, user.displayName] as const)),
+    roles: new Map(message.mentions.roles.map((role) => [role.id, role.name] as const)),
+  };
+  return [resolveDiscordMentions(message.content, mentionNames), ...attachmentNames].filter(Boolean).join(" ");
+}
 
 function reason(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -271,14 +281,8 @@ export class BridgeService {
   }
 
   private async handleDiscordMessage(message: Message): Promise<void> {
-    const attachmentNames = message.attachments.map((attachment) => safeAttachmentName(attachment.name));
     // Resolve mentions before attachments and chunking so the substituted names are charged to the 232-byte ceiling.
-    const mentionNames = {
-      members: new Map(message.mentions.members?.map((member) => [member.id, member.displayName] as const) ?? []),
-      users: new Map(message.mentions.users.map((user) => [user.id, user.displayName] as const)),
-      roles: new Map(message.mentions.roles.map((role) => [role.id, role.name] as const)),
-    };
-    const body = [resolveDiscordMentions(message.content, mentionNames), ...attachmentNames].filter(Boolean).join(" ");
+    const body = discordMessageBody(message);
     const ordinary = message.type === MessageType.Default || message.type === MessageType.Reply;
     if (!shouldForwardDiscord({
       channelId: message.channelId,
@@ -321,13 +325,16 @@ export class BridgeService {
     const displayName = await message.guild?.members.fetch(reactor.id)
       .then((member) => member.displayName)
       .catch(() => fallbackName) ?? fallbackName;
-    const plan = classifyDiscordReaction({ id: fullReaction.emoji.id, name: fullReaction.emoji.name });
 
     this.status.count("discordReceived");
     const job: DiscordReactionJob = {
       targetDiscordId: message.id,
-      tapback: plan.tapback,
-      replyText: formatReactionForMesh(plan, displayName),
+      displayName,
+      emoji: discordReactionDisplay({ id: fullReaction.emoji.id, name: fullReaction.emoji.name }),
+      targetBody: visibleDiscordReactionTarget(
+        discordMessageBody(message),
+        message.author.bot && message.author.username === "Mesh Bridge",
+      ),
     };
     if (!this.discordToMesh.enqueue(job)) {
       this.status.count("rejected");
@@ -381,51 +388,38 @@ export class BridgeService {
   private async deliverDiscordReactionToMesh(job: DiscordReactionJob): Promise<void> {
     // Resolve at delivery time so a just-queued bridge message can establish its ACKed root first.
     const meshRoot = this.replies.meshRootFor(job.targetDiscordId);
-    if (meshRoot === undefined) {
+    let text: string;
+    try {
+      text = meshRoot === undefined
+        ? formatUnmappedReactionForMesh(job.displayName, job.emoji, job.targetBody)
+        : formatMappedReactionForMesh(job.displayName, job.emoji);
+    } catch (error) {
       this.status.count("failures");
-      this.status.event("error", "MESH_REACTION_TARGET_UNAVAILABLE", { direction: "discordToMesh", referencedId: job.targetDiscordId });
-      await this.reportDiscord("Mesh Bridge: reaction delivery failed; 0/2 packets acknowledged.");
+      this.status.event("error", "MESH_REACTION_FORMAT_FAILED", { referencedId: job.targetDiscordId, reason: reason(error) });
+      await this.reportDiscord("Mesh Bridge: reaction delivery failed; 0/1 packets acknowledged.");
       return;
     }
 
-    let delivered = 0;
-    for (const [index, leg] of [
-      { text: job.tapback, emoji: 1 },
-      { text: job.replyText, emoji: undefined },
-    ].entries()) {
-      try {
-        const packetId = await retry(async () => {
-          const session = await this.waitForMesh();
-          await this.waitForMeshSendSlot();
-          const send = leg.emoji === undefined
-            ? session.device.sendText(leg.text, "broadcast", true, session.channel as Types.ChannelNumber, meshRoot)
-            : session.device.sendText(leg.text, "broadcast", true, session.channel as Types.ChannelNumber, meshRoot, leg.emoji);
-          return Promise.race([
-            send,
-            session.disconnected.then<never>(() => Promise.reject(new Error("Meshtastic disconnected before ACK"))),
-            delay(65_000, this.abort.signal).then<never>(() => Promise.reject(new Error("Meshtastic ACK timeout"))),
-          ]);
-        }, this.config.ackRetries, () => {
-          this.status.count("retries");
-          this.status.event("warn", "MESH_REACTION_SEND_RETRY", { leg: index + 1 });
-        });
-        // Reaction packets point back to the target without replacing that message's canonical mesh root.
-        this.replies.aliasMeshPacket(packetId, job.targetDiscordId);
-        delivered += 1;
-        this.status.count("meshSent");
-      } catch {
-        if (this.abort.signal.aborted) return;
-        // The second leg is still attempted after the first exhausts its independent retry budget.
-      }
-    }
-
-    if (delivered < 2) {
-      this.status.count("failures");
-      this.status.event("error", delivered === 0 ? "MESH_REACTION_DELIVERY_FAILED" : "MESH_REACTION_DELIVERY_PARTIAL", {
-        delivered,
-        total: 2,
+    try {
+      const packetId = await retry(async () => {
+        const session = await this.waitForMesh();
+        await this.waitForMeshSendSlot();
+        return Promise.race([
+          session.device.sendText(text, "broadcast", true, session.channel as Types.ChannelNumber, meshRoot),
+          session.disconnected.then<never>(() => Promise.reject(new Error("Meshtastic disconnected before ACK"))),
+          delay(65_000, this.abort.signal).then<never>(() => Promise.reject(new Error("Meshtastic ACK timeout"))),
+        ]);
+      }, this.config.ackRetries, (attempt) => {
+        this.status.count("retries");
+        this.status.event("warn", "MESH_REACTION_SEND_RETRY", { referencedId: job.targetDiscordId, attempt });
       });
-      await this.reportDiscord(`Mesh Bridge: reaction delivery ${delivered === 0 ? "failed" : "partially failed"}; ${delivered}/2 packets acknowledged.`);
+      this.replies.aliasMeshPacket(packetId, job.targetDiscordId);
+      this.status.count("meshSent");
+    } catch {
+      if (this.abort.signal.aborted) return;
+      this.status.count("failures");
+      this.status.event("error", "MESH_REACTION_DELIVERY_FAILED", { delivered: 0, total: 1 });
+      await this.reportDiscord("Mesh Bridge: reaction delivery failed; 0/1 packets acknowledged.");
     }
   }
 

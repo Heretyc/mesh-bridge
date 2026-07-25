@@ -8,10 +8,11 @@ import {
   ReplyCorrelator,
   TtlDedup,
   TtlMap,
-  classifyDiscordReaction,
+  discordReactionDisplay,
   discoverMeshtasticPath,
+  formatMappedReactionForMesh,
   formatMeshForDiscord,
-  formatReactionForMesh,
+  formatUnmappedReactionForMesh,
   hasRequiredDiscordPermissions,
   isMeshTapback,
   meshTapbackEmoji,
@@ -24,6 +25,7 @@ import {
   shouldForwardDiscordReaction,
   shouldForwardMesh,
   splitDiscordForMesh,
+  visibleDiscordReactionTarget,
 } from "./logic.js";
 
 const validEnv: NodeJS.ProcessEnv = {
@@ -58,23 +60,55 @@ test("Discord reaction routing accepts configured-channel users only", () => {
   assert.equal(shouldForwardDiscordReaction({ ...base, reactorBot: true }, validEnv.DISCORD_CHANNEL_ID!), false);
 });
 
-test("Discord reactions preserve one base codepoint plus optional VS16 and fall back for every other grapheme", () => {
-  assert.deepEqual(classifyDiscordReaction({ id: null, name: "😀" }), {
-    tapback: "😀", display: "😀", supported: true,
-  });
-  const heart = classifyDiscordReaction({ id: null, name: "❤️" });
-  assert.deepEqual(heart, { tapback: "❤️", display: "❤️", supported: true });
-  assert.equal(formatReactionForMesh(heart, "Ada]"), "❤️[Ada]]: Reacted with ❤️");
+test("Discord reactions format Unicode and custom emoji as one text packet", () => {
+  assert.equal(discordReactionDisplay({ id: null, name: "❤️" }), "❤️");
+  assert.equal(discordReactionDisplay({ id: "123", name: "lol" }), ":lol:");
+  assert.throws(() => discordReactionDisplay({ id: null, name: null }), /no usable emoji/u);
+  assert.equal(formatMappedReactionForMesh("Ada", "❤️"), "Ada reacted with ❤️");
+  assert.equal(formatMappedReactionForMesh("Ada", ":lol:"), "Ada reacted with :lol:");
+});
 
-  for (const [emoji, display] of [
-    [{ id: "123", name: "lol" }, ":lol:"],
-    [{ id: null, name: "👍🏽" }, "👍🏽"],
-    [{ id: null, name: "🇺🇸" }, "🇺🇸"],
-    [{ id: null, name: "👩‍💻" }, "👩‍💻"],
-  ] as const) {
-    const plan = classifyDiscordReaction(emoji);
-    assert.deepEqual(plan, { tapback: "✳️", display, supported: false });
+test("reaction excerpts cap by grapheme, keep ZWJ sequences whole, and normalize bridge attribution", () => {
+  for (const length of [39, 40]) {
+    assert.equal(
+      formatUnmappedReactionForMesh("Ada", "😀", "x".repeat(length)),
+      `Ada reacted 😀 to "${"x".repeat(length)}"`,
+    );
   }
+  assert.equal(
+    formatUnmappedReactionForMesh("Ada", "😀", "x".repeat(41)),
+    `Ada reacted 😀 to "${"x".repeat(40)}..."`,
+  );
+  assert.equal(
+    formatUnmappedReactionForMesh("Ada", "😀", `${"x".repeat(39)}👩‍💻tail`),
+    `Ada reacted 😀 to "${"x".repeat(39)}👩‍💻..."`,
+  );
+  assert.equal(visibleDiscordReactionTarget("**[Xandi]:** hello", true), "[Xandi]: hello");
+  assert.equal(visibleDiscordReactionTarget("**[Xandi]:** hello", false), "**[Xandi]:** hello");
+  for (const name of ["Base_Station", "K*Node", "Ana [Bot]", String.raw`Slash\Node`, "Tilde~~Node", "Tick`Node", ">Lead", "Pipe||Node"]) {
+    assert.equal(visibleDiscordReactionTarget(formatMeshForDiscord(name, "hello"), true), `[${name}]: hello`);
+  }
+  assert.equal(
+    visibleDiscordReactionTarget(formatMeshForDiscord("Base_Station", String.raw`body \_ \[ \*`), true),
+    String.raw`[Base_Station]: body \_ \[ \*`,
+  );
+  assert.equal(
+    formatUnmappedReactionForMesh("Ada", "😀", visibleDiscordReactionTarget("**[Xandi]:** hello", true)),
+    'Ada reacted 😀 to "[Xandi]: hello"',
+  );
+});
+
+test("reaction excerpts shorten to the Meshtastic byte limit and never split", () => {
+  const text = formatUnmappedReactionForMesh("N".repeat(100), "😀", "界".repeat(40));
+  assert.ok(Buffer.byteLength(text, "utf8") <= MESHTASTIC_TEXT_BYTES);
+  assert.match(text, /\.\.\."$/u);
+  assert.ok(!text.includes("界".repeat(40)));
+  assert.throws(() => formatMappedReactionForMesh("x".repeat(MESHTASTIC_TEXT_BYTES), "😀"), /payload limit/u);
+  assert.throws(() => formatUnmappedReactionForMesh("A", "😀", ""), /no usable text/u);
+  assert.throws(
+    () => formatUnmappedReactionForMesh("x".repeat(MESHTASTIC_TEXT_BYTES), "😀", "body"),
+    /leaves no room/u,
+  );
 });
 
 test("mesh tapbacks require emoji and reply ids and accept only the decoded emoji payload", () => {
