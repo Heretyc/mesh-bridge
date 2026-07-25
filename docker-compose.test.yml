@@ -1,0 +1,8 @@
+services:
+  mesh-bridge-test:
+    build:
+      context: .
+      target: builder
+    command: npm test
+    environment:
+      MESH_BRIDGE_STATE_DIR: /tmp/mesh-bridge

@@ -1,0 +1,16 @@
+services:
+  mesh-bridge:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MESH_BRIDGE_STATE_DIR: /var/lib/mesh-bridge
+    volumes:
+      - mesh-state:/var/lib/mesh-bridge
+    devices:
+      - "/dev/ttyUSB0:/dev/ttyUSB0"
+    group_add:
+      - dialout
+
+volumes:
+  mesh-state:

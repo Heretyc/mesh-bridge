@@ -12,11 +12,13 @@
     "test": "npm run build && node --test dist/*.test.js",
     "start": "node dist/service.js",
     "tui": "node dist/tui.js",
-    "service:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install.ps1",
-    "service:start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start.ps1",
-    "service:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop.ps1",
-    "service:status": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/status.ps1",
-    "service:uninstall": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/uninstall.ps1"
+    "service:install": "node dist/servicectl.js install",
+    "service:start": "node dist/servicectl.js start",
+    "service:stop": "node dist/servicectl.js stop",
+    "service:status": "node dist/servicectl.js status",
+    "service:uninstall": "node dist/servicectl.js uninstall",
+    "service:attach": "node dist/servicectl.js attach",
+    "service:restart": "node dist/servicectl.js restart"
   },
   "dependencies": {
     "@meshtastic/core": "2.6.7",

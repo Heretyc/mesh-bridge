@@ -1,14 +1,14 @@
 # Mesh Bridge
 
-Windows-only, headless Discord ↔ Meshtastic USB serial bridge. The Discord bot must be named exactly **Mesh Bridge**. A separate read-only terminal UI attaches over authenticated loopback IPC; there is no GUI, HTTP server, database, MQTT, BLE, or telemetry.
+Headless Discord ↔ Meshtastic USB serial bridge for Windows, Linux, macOS, and Docker. The Discord bot must be named exactly **Mesh Bridge**. A separate read-only terminal UI attaches over authenticated loopback IPC; there is no GUI, HTTP server, database, MQTT, BLE, or telemetry.
 
 ## Requirements
 
-- Windows 10/11 x64 and PowerShell 5.1+
+- Windows 10/11 x64 with PowerShell 5.1+, Linux with systemd user services, macOS with launchd LaunchAgents, or Docker on Linux
 - Node.js 22 or newer
 - Exactly one Meshtastic USB serial device connected; unrelated USB serial devices may remain connected
 - One enabled, encrypted Meshtastic channel with a unique name of at most 11 UTF-8 bytes
-- Administrator access only for Windows service installation and control
+- Administrator access only for Windows service installation and control; Linux/macOS install as user services
 
 The bridge uses the latest published official Node serial pairing: `@meshtastic/transport-node-serial@0.0.2` with `@meshtastic/core@2.6.7`. These are also the versions in Meshtastic Web release `v2.7.1`. The active Meshtastic main branch contains an unreleased replacement SDK; this project does not depend on unreleased source.
 
@@ -29,7 +29,7 @@ The bot validates its username, channel visibility, and these four permissions a
 
 Configure the desired channel on the radio first. Put its exact, case-sensitive name in `MESHTASTIC_CHANNEL_NAME`; the PSK remains on the radio and is never stored by this service. Startup fails closed if the name is missing, duplicated, disabled, unencrypted, or outside channel indexes 0–7. The local node number and node long names are learned during device configuration.
 
-USB discovery considers Windows serial ports backed by USB metadata, probes them sequentially with the official Meshtastic configuration handshake, and activates forwarding only after exactly one radio responds. Locked and non-Meshtastic ports are rejected; zero or multiple responsive radios fail closed and retry with exponential backoff.
+USB discovery is platform-aware: Windows probes USB-backed COM ports, Linux probes `/dev/ttyUSB*` and `/dev/ttyACM*`, and macOS opens only `/dev/cu.*` devices. Candidates are probed sequentially with the official Meshtastic configuration handshake, and forwarding activates only after exactly one radio responds. Locked and non-Meshtastic ports are rejected; zero or multiple responsive radios fail closed and retry with exponential backoff.
 
 ## Install and configure
 
@@ -51,27 +51,33 @@ The service warns if `.env` inherits readable permissions for broad Windows grou
 icacls.exe .env /inheritance:r /grant:r "${env:USERNAME}:(F)" "*S-1-5-18:(R)" "*S-1-5-19:(R)"
 ```
 
-## Windows service
+## Service operation
 
-The installer downloads the pinned WinSW 2.12.0 x64 binary from the official release and verifies SHA-256 `05B82D46AD331CC16BDC00DE5C6332C1EF818DF8CEEFCD49C726553209B3A0DA`. It installs `Mesh Bridge` as `LocalService`, Automatic (delayed start), with restart-on-failure. It survives logoff and reboot.
+The service verbs are the same on Windows, Linux, and macOS:
 
-Run service operations from elevated PowerShell:
-
-```powershell
+```bash
 npm run service:install
 npm run service:start
 npm run service:status
 npm run service:stop
 npm run service:uninstall
+npm run service:attach
+npm run service:restart
 ```
 
-Uninstall removes the Windows service registration but deliberately retains `.env`, logs, and the downloaded wrapper.
+Windows shells the existing audited PowerShell scripts. The installer downloads the pinned WinSW 2.12.0 x64 binary from the official release and verifies SHA-256 `05B82D46AD331CC16BDC00DE5C6332C1EF818DF8CEEFCD49C726553209B3A0DA`. It installs `Mesh Bridge` as `LocalService`, Automatic (delayed start), with restart-on-failure. It survives logoff and reboot.
+
+Linux installs a systemd user unit at `~/.config/systemd/user/mesh-bridge.service`, enables it with `systemctl --user enable --now mesh-bridge.service`, and enables linger with `loginctl enable-linger "$USER"` so it survives logout and reboot. Install also creates attach and restart `.desktop` launchers under `~/.local/share/applications`.
+
+macOS installs a launchd LaunchAgent at `~/Library/LaunchAgents/dev.meshbridge.plist` with `RunAtLoad` and `KeepAlive`. Install also creates attach and restart `.command` launchers under `~/Applications`.
+
+Uninstall removes the OS service registration but deliberately retains `.env`, logs, and local state. More detail is in `docs/spec/cross-platform-service.md`.
 
 ## Read-only TUI
 
 From a normal terminal in the project directory:
 
-```powershell
+```bash
 npm run tui
 ```
 
@@ -101,6 +107,24 @@ Mesh → Discord accepts only decoded `TEXT_MESSAGE_APP` packets on the resolved
 - Reply correlation is persisted in one local JSONL journal per validated Discord channel id under the state journal directory. It is capped at 10,000 live entries per direction with a rolling 30-day lifetime, replays at startup, tolerates malformed lines, and compacts atomically at startup and daily local 02:00. A journal filesystem failure never stops relay traffic; in-memory reply correlation continues and the TUI/stderr report the degraded state once.
 
 WinSW wrapper output remains under the Windows service wrapper log path.
+
+## Docker
+
+The Docker image targets Node 22 LTS on `node:22-bookworm-slim`. Production Compose uses `restart: unless-stopped`, reads `.env`, mounts a named state volume at `/var/lib/mesh-bridge`, maps `/dev/ttyUSB0`, adds the `dialout` group, and publishes no ports.
+
+```bash
+docker build -t mesh-bridge .
+docker compose up -d
+```
+
+For disposable container testing without `.env` or serial devices:
+
+```bash
+docker compose -f docker-compose.test.yml up --build --abort-on-container-exit --exit-code-from mesh-bridge-test
+docker compose -f docker-compose.test.yml down --volumes
+```
+
+The primary target is `linux/amd64`; build arm64 on arm64 hardware so native serial bits compile for the right ABI. More detail is in `docs/spec/docker.md`.
 
 ## Recovery
 

@@ -47,6 +47,7 @@ import {
 } from "./logic.js";
 import { ChannelJournal } from "./journal.js";
 import { logDir } from "./paths.js";
+import { meshtasticSerialCandidates } from "./serial.js";
 import { IpcServer, StatusStore } from "./status.js";
 import { TelemetrySink } from "./telemetry.js";
 
@@ -490,7 +491,7 @@ export class BridgeService {
 
   private async openMesh(): Promise<MeshSession> {
     const ports = await SerialPort.list();
-    const candidates = ports.filter((port) => Boolean(port.vendorId) || /^USB/i.test(port.pnpId ?? ""));
+    const candidates = meshtasticSerialCandidates(ports);
     const sessions = new Map<string, MeshSession>();
     try {
       const serialPath = await discoverMeshtasticPath(candidates.map((port) => port.path), async (path) => {

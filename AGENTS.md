@@ -65,6 +65,10 @@ read it first and treat it as the canonical hub.
   working tree or any memory-tool use.
 - `docs/spec/mapping-journal.md`: read before changing reply correlation
   persistence, journal format, or retention/compaction behavior.
+- `docs/spec/cross-platform-service.md`: read before changing service
+  install/autostart, `servicectl`, platform builders, or serial discovery.
+- `docs/spec/docker.md`: read before changing Dockerfile or Compose service
+  packaging.
 - `docs/spec/dev-loop/_INDEX.md`: read when you need to choose which dev-loop
   leaf spec applies and want the map of dev-loop orchestration guidance.
 - `docs/spec/dev-loop/claude-routine-prompt.md`: read before creating or
