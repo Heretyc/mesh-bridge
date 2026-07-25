@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { commandFile, launchAgentPlist } from "./platform/launchd.js";
 import { desktopEntry, systemdUserUnit } from "./platform/systemd.js";
-import { winswXml } from "./platform/winsw.js";
 
 function assertWellFormedXml(source: string): void {
   const stack: string[] = [];
@@ -66,32 +68,22 @@ test("launchd plist is well-formed and escapes interpolated values", () => {
   ]) assert.ok(plist.includes(required), required);
 });
 
-test("WinSW XML preserves the audited Windows service fields", () => {
-  const xml = winswXml({
-    nodePath: "C:\\Program Files\\nodejs\\node.exe",
-    servicePath: "C:\\Mesh Bridge\\dist\\service.js",
-    workingDirectory: "C:\\Mesh Bridge",
-  });
-  assert.equal(xml, `<service>
-  <id>MeshBridge</id>
-  <name>Mesh Bridge</name>
-  <description>Discord to Meshtastic USB serial bridge</description>
-  <executable>C:\\Program Files\\nodejs\\node.exe</executable>
-  <arguments>&quot;C:\\Mesh Bridge\\dist\\service.js&quot;</arguments>
-  <workingdirectory>C:\\Mesh Bridge</workingdirectory>
-  <startmode>Automatic</startmode>
-  <delayedAutoStart/>
-  <serviceaccount>
-    <domain>NT AUTHORITY</domain>
-    <user>LocalService</user>
-  </serviceaccount>
-  <stoptimeout>20 sec</stoptimeout>
-  <onfailure action="restart" delay="10 sec" />
-  <resetfailure>1 hour</resetfailure>
-  <logpath>C:\\Mesh Bridge\\logs</logpath>
-  <log mode="roll"></log>
-</service>
-`);
+test("install.ps1 pins the audited WinSW binary and Windows service fields", () => {
+  // The test runs from dist/platform.test.js, so walk up to the repo root.
+  const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const installScript = readFileSync(join(repoRoot, "scripts", "install.ps1"), "utf8");
+  for (const required of [
+    "https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW-x64.exe",
+    "05B82D46AD331CC16BDC00DE5C6332C1EF818DF8CEEFCD49C726553209B3A0DA",
+    "<id>MeshBridge</id>",
+    "<name>Mesh Bridge</name>",
+    "<domain>NT AUTHORITY</domain>",
+    "<user>LocalService</user>",
+    "<startmode>Automatic</startmode>",
+    "<delayedAutoStart/>",
+    "<stoptimeout>20 sec</stoptimeout>",
+    '<onfailure action="restart" delay="10 sec" />',
+  ]) assert.ok(installScript.includes(required), required);
 });
 
 test("native launcher builders emit terminal attach and restart commands", () => {
