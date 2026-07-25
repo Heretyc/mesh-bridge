@@ -60,6 +60,12 @@ test("win32 maps service verbs to the existing PowerShell scripts", async () => 
   assert.equal(d.writes.at(-1), "win32 installed=false running=false autostart=false\n");
 });
 
+test("win32 status reports a stopped installed service as not running", async () => {
+  const d = deps([1], ["Stopped"]);
+  assert.equal(await runServiceCtl(["status"], "win32", d), 1);
+  assert.equal(d.writes.at(-1), "win32 installed=true running=false autostart=true\n");
+});
+
 test("linux install writes unit and launchers, then enables user service and linger", async () => {
   const d = deps();
   assert.equal(await runServiceCtl(["install"], "linux", d), 0);

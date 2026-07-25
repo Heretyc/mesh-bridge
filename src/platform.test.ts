@@ -86,7 +86,7 @@ test("install.ps1 pins the audited WinSW binary and Windows service fields", () 
   ]) assert.ok(installScript.includes(required), required);
 });
 
-test("install.ps1 provisions the ProgramData state root for LocalService without broadening access", () => {
+test("install.ps1 provisions the ProgramData state root with a restricted ACL", () => {
   const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
   const installScript = readFileSync(join(repoRoot, "scripts", "install.ps1"), "utf8");
   // Creates the ProgramData state root plus its Logs and journal subfolders,
@@ -99,20 +99,28 @@ test("install.ps1 provisions the ProgramData state root for LocalService without
     installScript,
     /New-Item -ItemType Directory -Force -Path \$stateRoot, \$stateLogs, \$stateJournal/u,
   );
-  // Grants exactly LocalService (SID S-1-5-19) modify on the state root, applied
-  // recursively (/T) to its subfolders.
+  assert.ok(installScript.includes("& icacls.exe $stateRoot /reset /T /C"), "recursive ACL reset");
   assert.ok(
-    installScript.includes("& icacls.exe $stateRoot /grant '*S-1-5-19:(OI)(CI)(M)' /T /C"),
-    "LocalService modify grant on the ProgramData state root",
+    installScript.includes(
+      "& icacls.exe $stateRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-32-544:(OI)(CI)(F)' '*S-1-5-19:(OI)(CI)(M)' /C",
+    ),
+    "restricted inherited ACL on the ProgramData state root",
   );
+  for (const allowed of ["*S-1-5-18:(OI)(CI)(F)", "*S-1-5-32-544:(OI)(CI)(F)", "*S-1-5-19:(OI)(CI)(M)"]) {
+    assert.ok(installScript.includes(allowed), allowed);
+  }
   // Never widens access to broad principals: the files hold full message bodies.
   for (const forbidden of [
     "Everyone",
     "BUILTIN\\Users",
     "Authenticated Users",
+    "INTERACTIVE",
+    "ALL APPLICATION PACKAGES",
     "*S-1-1-0",
     "*S-1-5-32-545",
     "*S-1-5-11",
+    "*S-1-5-4",
+    "*S-1-15-2-1",
   ]) {
     assert.ok(!installScript.includes(forbidden), `install.ps1 must not grant ${forbidden}`);
   }

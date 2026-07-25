@@ -21,9 +21,10 @@ The JSONL file is opened with mode `0600`.
 
 On Windows the service runs as `NT AUTHORITY\LocalService`, so `scripts/install.ps1`
 pre-creates the `%ProgramData%\Mesh Bridge` state root with its `Logs` and `journal`
-subfolders and grants only that account modify rights. No broad principal (Everyone,
-Users, Authenticated Users) is granted access, keeping the message bodies these files
-contain restricted.
+subfolders, resets stale descendant ACLs, breaks inherited permissions on the state
+root, and grants only SYSTEM full control, Administrators full control, and
+LocalService modify rights. These files contain full message bodies, so inherited
+access from `%ProgramData%` is not retained.
 
 ## Record Shape
 

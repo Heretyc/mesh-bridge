@@ -69,10 +69,10 @@ $xmlScript = [Security.SecurityElement]::Escape($serviceJs)
 & icacls.exe (Join-Path $base 'logs') /grant '*S-1-5-19:(OI)(CI)(M)' /T /C | Out-Null
 & icacls.exe $runtime /grant '*S-1-5-19:(OI)(CI)(M)' /T /C | Out-Null
 & icacls.exe $envFile /grant '*S-1-5-19:(R)' /C | Out-Null
-# Grant only LocalService modify on the ProgramData state root and, via /T, its
-# Logs and journal subfolders. No broad principal is granted: these files contain
-# full message bodies and stay restricted.
-& icacls.exe $stateRoot /grant '*S-1-5-19:(OI)(CI)(M)' /T /C | Out-Null
+# Reset stale explicit ACEs on existing descendants, then protect the state root
+# and let the restricted root ACL inherit down to Logs, journal, and their files.
+& icacls.exe $stateRoot /reset /T /C | Out-Null
+& icacls.exe $stateRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-32-544:(OI)(CI)(F)' '*S-1-5-19:(OI)(CI)(M)' /C | Out-Null
 
 & $wrapper install
 if ($LASTEXITCODE -ne 0) { throw "WinSW install failed with exit code $LASTEXITCODE." }
