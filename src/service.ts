@@ -23,7 +23,6 @@ import {
   BoundedQueue,
   ReplyCorrelator,
   TtlDedup,
-  TtlMap,
   backoff,
   delay,
   discordReactionDisplay,
@@ -46,6 +45,7 @@ import {
   splitDiscordForMesh,
   visibleDiscordReactionTarget,
 } from "./logic.js";
+import { ChannelJournal } from "./journal.js";
 import { logDir } from "./paths.js";
 import { IpcServer, StatusStore } from "./status.js";
 import { TelemetrySink } from "./telemetry.js";
@@ -139,6 +139,7 @@ export class BridgeService {
   private readonly meshToDiscord: BoundedQueue<InboundJob>;
   private readonly discordDedup: TtlDedup;
   private readonly meshDedup: TtlDedup;
+  private readonly journal: ChannelJournal;
   private readonly replies: ReplyCorrelator;
   private nodeNames = new Map<number, string>();
   private discord: Client | undefined;
@@ -170,10 +171,14 @@ export class BridgeService {
     this.status.useTelemetry(this.telemetry);
     this.discordDedup = new TtlDedup(config.dedupTtlMs, config.queueLimit * 10);
     this.meshDedup = new TtlDedup(config.dedupTtlMs, config.queueLimit * 10);
-    this.replies = new ReplyCorrelator(
-      new TtlMap<string, number>(config.dedupTtlMs, config.queueLimit * 10),
-      new TtlMap<number, string>(config.dedupTtlMs, config.queueLimit * 10),
-    );
+    this.journal = new ChannelJournal(config.discordChannelId, {
+      onDegraded: (error) => {
+        this.status.journalDegraded(true, "JOURNAL_WRITE_FAILED", { error: String(error) });
+        process.stderr.write("[Mesh Bridge] warning: reply mapping journal writes failed; continuing with in-memory reply correlation\n");
+      },
+      onRecovered: () => this.status.journalDegraded(false, "JOURNAL_WRITE_RECOVERED"),
+    });
+    this.replies = new ReplyCorrelator(this.journal.meshRootByDiscordId, this.journal.discordIdByMeshId);
     this.discordToMesh = new BoundedQueue(config.queueLimit, (depth) => this.status.queue("discordToMesh", depth));
     this.meshToDiscord = new BoundedQueue(config.queueLimit, (depth) => this.status.queue("meshToDiscord", depth));
   }
@@ -715,6 +720,7 @@ export class BridgeService {
     this.discord?.destroy();
     await this.mesh?.close().catch(() => undefined);
     await this.ipc.close();
+    this.journal.close();
     this.telemetry.close();
   }
 }

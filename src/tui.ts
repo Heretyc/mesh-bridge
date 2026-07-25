@@ -26,6 +26,7 @@ function render(status: StatusSnapshot): void {
     `Queues: Discord→Mesh ${status.queues.discordToMesh}  Mesh→Discord ${status.queues.meshToDiscord}`,
     `Counters: ${counters}`,
     ...(status.logDegraded ? ["", "Telemetry log writes are degraded; relay traffic is still running."] : []),
+    ...(status.journalDegraded ? ["", "Reply mapping journal writes are degraded; relay traffic is still running."] : []),
     "",
     "Sanitized rolling events",
     ...events,

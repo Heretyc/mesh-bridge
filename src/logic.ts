@@ -305,6 +305,13 @@ export class TtlMap<K, V> {
     return entry.value;
   }
 
+  /** Non-expired [key,value,at] triples in insertion order. Read-only: no eviction side effects. */
+  public liveEntries(now = Date.now()): Array<[K, V, number]> {
+    const out: Array<[K, V, number]> = [];
+    for (const [key, entry] of this.entries) if (now - entry.at < this.ttlMs) out.push([key, entry.value, entry.at]);
+    return out;
+  }
+
   public get size(): number {
     return this.entries.size;
   }

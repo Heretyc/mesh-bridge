@@ -98,6 +98,7 @@ Mesh → Discord accepts only decoded `TEXT_MESSAGE_APP` packets on the resolved
 - Local telemetry is one OTel-shaped JSONL file named `telemetry.jsonl`: `%ProgramData%\Mesh Bridge\Logs` on Windows, `${XDG_STATE_HOME:-$HOME/.local/state}/mesh-bridge/logs` on Linux, and `$HOME/Library/Logs/Mesh Bridge` on macOS. `MESH_BRIDGE_STATE_DIR` overrides the root for tests and portable installs.
 - The telemetry file is local-only: there is no exporter, collector, HTTP endpoint, or new dependency. Full Discord and Mesh message bodies are written to disk, with exact `DISCORD_TOKEN` and `IPC_TOKEN` value redaction before write. The TUI and IPC snapshot stay sanitized and do not show message bodies.
 - There is exactly one active telemetry file. Startup and the daily local 02:00 prune atomically rewrite it to keep records from the last 24 hours, skip malformed lines, and allow near-48-hour physical retention. A telemetry filesystem failure never stops relay traffic; the TUI and stderr report the degraded state once and report recovery once.
+- Reply correlation is persisted in one local JSONL journal per validated Discord channel id under the state journal directory. It is capped at 10,000 live entries per direction with a rolling 30-day lifetime, replays at startup, tolerates malformed lines, and compacts atomically at startup and daily local 02:00. A journal filesystem failure never stops relay traffic; in-memory reply correlation continues and the TUI/stderr report the degraded state once.
 
 WinSW wrapper output remains under the Windows service wrapper log path.
 
@@ -107,7 +108,7 @@ WinSW wrapper output remains under the Windows service wrapper log path.
 - **Zero or multiple Meshtastic radios:** connect exactly one configured radio and watch `npm run tui`; unrelated or locked USB serial ports are reported as rejected and retry is automatic.
 - **Channel failure:** correct the exact encrypted channel name on the radio and in `.env`, then restart the service.
 - **Discord failure:** confirm the bot is named `Mesh Bridge`, Message Content Intent is enabled, the channel ID is correct, and only View Channel + Send Messages + Read Message History + Add Reactions are granted.
-- **Replies arrive unthreaded:** expected when the referenced message predates the service start or its correlation aged past `DEDUP_TTL_MS`, or when the Discord target was deleted. The bridge relays the text unthreaded and records `REPLY_TARGET_UNAVAILABLE` with only the direction and referenced id; no action is needed.
+- **Replies arrive unthreaded:** expected when the referenced message predates the 30-day reply journal window, was evicted from the 10,000-entry direction cap, or when the Discord target was deleted. The bridge relays the text unthreaded and records `REPLY_TARGET_UNAVAILABLE` with only the direction and referenced id; no action is needed.
 - **Reaction reports 0/1:** the single ACK-requested reaction text exhausted its retry budget or could not fit safely. Check the sanitized TUI event and link state; an unavailable target mapping falls back to an unthreaded excerpt.
 - **Service will not start:** inspect the WinSW wrapper log and local `telemetry.jsonl`, then run `node dist\service.js` interactively after stopping the service.
 - **TUI cannot attach:** verify `IPC_TOKEN` and `IPC_PORT` match the service `.env`; only one service instance can own the port.
@@ -117,8 +118,8 @@ WinSW wrapper output remains under the Windows service wrapper log path.
 - Discovery probes accessible USB serial ports sequentially, so an unrelated responsive port can delay startup by up to `CONFIG_TIMEOUT_MS`. It never picks the first port and still fails closed if zero or multiple Meshtastic radios answer.
 - The official Meshtastic packages publish incomplete declaration aliases. Application code remains strict TypeScript, while `skipLibCheck` is enabled only for dependency declaration files.
 - The official core ACK timeout is 60 seconds. With the default two retries, a final radio failure can take about three minutes.
-- State, deduplication, reply correlation, names, and pending work are memory-only and reset on service restart. Replies to messages bridged before a restart relay unthreaded.
-- Reply correlation is bounded by `DEDUP_TTL_MS` and ten times `QUEUE_LIMIT` entries per direction; older correlations are evicted in insertion order and their replies relay unthreaded.
+- Deduplication, node names, queues, and pending work are memory-only and reset on service restart.
+- Reply correlation survives restart through the per-channel journal. It is bounded by 10,000 entries per direction and a rolling 30-day window; older correlations are logically expired immediately and their replies relay unthreaded.
 - Discord reaction removals are intentionally ignored because the official Meshtastic core/protobuf API exposes no tapback-removal operation.
 - A node that has not advertised its long name uses `Unknown !nodeid` until NodeInfo arrives.
 

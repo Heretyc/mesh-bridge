@@ -63,6 +63,8 @@ read it first and treat it as the canonical hub.
   automated/scheduled agent prompt injection.
 - `docs/spec/memory-policy.md`: read before any write outside the repository
   working tree or any memory-tool use.
+- `docs/spec/mapping-journal.md`: read before changing reply correlation
+  persistence, journal format, or retention/compaction behavior.
 - `docs/spec/dev-loop/_INDEX.md`: read when you need to choose which dev-loop
   leaf spec applies and want the map of dev-loop orchestration guidance.
 - `docs/spec/dev-loop/claude-routine-prompt.md`: read before creating or

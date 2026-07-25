@@ -24,7 +24,7 @@ managed block, which must be preserved verbatim when present.`;
 
 // One Load Trigger is registered in AGENTS.md for every non-AGENTS Markdown doc.
 // Keep this in sync with the AGENTS.md "Load Triggers" section.
-const EXPECTED_NON_AGENTS_MARKDOWN = 20;
+const EXPECTED_NON_AGENTS_MARKDOWN = 21;
 
 const root = process.cwd();
 const failures = [];

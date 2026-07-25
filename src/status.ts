@@ -25,6 +25,7 @@ export interface StatusSnapshot {
   counters: Record<string, number>;
   queues: { discordToMesh: number; meshToDiscord: number };
   logDegraded: boolean;
+  journalDegraded: boolean;
   events: EventLine[];
 }
 
@@ -47,6 +48,7 @@ export class StatusStore extends EventEmitter {
     counters: { discordReceived: 0, meshSent: 0, meshReceived: 0, discordSent: 0, retries: 0, failures: 0, rejected: 0 },
     queues: { discordToMesh: 0, meshToDiscord: 0 },
     logDegraded: false,
+    journalDegraded: false,
     events: [],
   };
 
@@ -87,6 +89,12 @@ export class StatusStore extends EventEmitter {
   public logDegraded(degraded: boolean, code: string, meta: Record<string, unknown> = {}): void {
     this.state.logDegraded = degraded;
     this.pushEvent(degraded ? "warn" : "info", code, meta);
+    this.changed();
+  }
+
+  public journalDegraded(degraded: boolean, code: string, meta: Record<string, unknown> = {}): void {
+    this.state.journalDegraded = degraded;
+    if (degraded) this.pushEvent("warn", code, meta);
     this.changed();
   }
 
