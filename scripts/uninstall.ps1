@@ -4,4 +4,4 @@ if (-not (Test-Path -LiteralPath $wrapper)) { Write-Host 'Mesh Bridge is not ins
 & $wrapper stop | Out-Null
 & $wrapper uninstall
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-Write-Host 'Mesh Bridge service uninstalled. Configuration, logs, and the wrapper remain on disk.'
+Write-Host 'Mesh Bridge service uninstalled. Configuration, the %ProgramData%\Mesh Bridge state (logs and journal), and the wrapper remain on disk.'

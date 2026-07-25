@@ -18,7 +18,9 @@ npm run service:restart
 
 Windows keeps the audited PowerShell and WinSW path. `servicectl` shells `scripts/install.ps1`, `start.ps1`, `stop.ps1`, `status.ps1`, and `uninstall.ps1`.
 
-The installer downloads pinned WinSW 2.12.0 x64, verifies its SHA-256, and installs service `MeshBridge` as `NT AUTHORITY\LocalService` with Automatic delayed start, `stoptimeout` 20 seconds, and restart on failure after 10 seconds. Service control requires elevated PowerShell. Uninstall removes the service registration and leaves `.env`, logs, and the wrapper on disk.
+The installer downloads pinned WinSW 2.12.0 x64, verifies its SHA-256, and installs service `MeshBridge` as `NT AUTHORITY\LocalService` with Automatic delayed start, `stoptimeout` 20 seconds, and restart on failure after 10 seconds. Service control requires elevated PowerShell.
+
+Because the service runs as `NT AUTHORITY\LocalService` (SID `S-1-5-19`), the installer also creates the `%ProgramData%\Mesh Bridge` state root and its `Logs` and `journal` subfolders and grants that account modify (`(OI)(CI)(M)`, recursive via `/T`) on them, so the telemetry file and the reply-mapping journal can be written instead of failing open into degraded mode. No broader principal (Everyone, Users, Authenticated Users) is granted access because these files contain full message bodies. Uninstall removes the service registration and retains `.env`, the wrapper, and the `%ProgramData%\Mesh Bridge` state (logs and journal) on disk.
 
 Logs live under `%ProgramData%\Mesh Bridge\Logs`. Reply journals live under `%ProgramData%\Mesh Bridge\journal` unless `MESH_BRIDGE_STATE_DIR` is set, in which case logs use `<root>\Logs` and journals use `<root>\journal`.
 

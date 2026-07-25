@@ -86,6 +86,38 @@ test("install.ps1 pins the audited WinSW binary and Windows service fields", () 
   ]) assert.ok(installScript.includes(required), required);
 });
 
+test("install.ps1 provisions the ProgramData state root for LocalService without broadening access", () => {
+  const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const installScript = readFileSync(join(repoRoot, "scripts", "install.ps1"), "utf8");
+  // Creates the ProgramData state root plus its Logs and journal subfolders,
+  // resolved the same way src/paths.ts does for win32.
+  assert.match(installScript, /\$env:ProgramData/u);
+  assert.match(installScript, /Join-Path \$programData 'Mesh Bridge'/u);
+  assert.match(installScript, /Join-Path \$stateRoot 'Logs'/u);
+  assert.match(installScript, /Join-Path \$stateRoot 'journal'/u);
+  assert.match(
+    installScript,
+    /New-Item -ItemType Directory -Force -Path \$stateRoot, \$stateLogs, \$stateJournal/u,
+  );
+  // Grants exactly LocalService (SID S-1-5-19) modify on the state root, applied
+  // recursively (/T) to its subfolders.
+  assert.ok(
+    installScript.includes("& icacls.exe $stateRoot /grant '*S-1-5-19:(OI)(CI)(M)' /T /C"),
+    "LocalService modify grant on the ProgramData state root",
+  );
+  // Never widens access to broad principals: the files hold full message bodies.
+  for (const forbidden of [
+    "Everyone",
+    "BUILTIN\\Users",
+    "Authenticated Users",
+    "*S-1-1-0",
+    "*S-1-5-32-545",
+    "*S-1-5-11",
+  ]) {
+    assert.ok(!installScript.includes(forbidden), `install.ps1 must not grant ${forbidden}`);
+  }
+});
+
 test("native launcher builders emit terminal attach and restart commands", () => {
   assert.equal(desktopEntry({ name: "Mesh Bridge Attach", exec: "/usr/bin/node /opt/mesh/dist/tui.js" }), `[Desktop Entry]
 Type=Application

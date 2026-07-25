@@ -14,6 +14,17 @@ if (-not (Test-Path -LiteralPath $serviceJs)) { throw 'Missing dist\service.js. 
 $node = (Get-Command node.exe -ErrorAction Stop).Source
 New-Item -ItemType Directory -Force -Path $runtime, (Join-Path $base 'logs') | Out-Null
 
+# The service runs as NT AUTHORITY\LocalService (SID S-1-5-19) and writes its
+# OTel telemetry and reply-mapping journal under the ProgramData state root
+# resolved by src/paths.ts (honor %ProgramData%, fall back to C:\ProgramData).
+# Provision that tree so both subsystems can create their files instead of
+# failing open into degraded mode on a real install.
+$programData = if ($env:ProgramData) { $env:ProgramData } else { 'C:\ProgramData' }
+$stateRoot = Join-Path $programData 'Mesh Bridge'
+$stateLogs = Join-Path $stateRoot 'Logs'
+$stateJournal = Join-Path $stateRoot 'journal'
+New-Item -ItemType Directory -Force -Path $stateRoot, $stateLogs, $stateJournal | Out-Null
+
 $url = 'https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW-x64.exe'
 $expectedHash = '05B82D46AD331CC16BDC00DE5C6332C1EF818DF8CEEFCD49C726553209B3A0DA'
 if (-not (Test-Path -LiteralPath $wrapper)) {
@@ -58,6 +69,10 @@ $xmlScript = [Security.SecurityElement]::Escape($serviceJs)
 & icacls.exe (Join-Path $base 'logs') /grant '*S-1-5-19:(OI)(CI)(M)' /T /C | Out-Null
 & icacls.exe $runtime /grant '*S-1-5-19:(OI)(CI)(M)' /T /C | Out-Null
 & icacls.exe $envFile /grant '*S-1-5-19:(R)' /C | Out-Null
+# Grant only LocalService modify on the ProgramData state root and, via /T, its
+# Logs and journal subfolders. No broad principal is granted: these files contain
+# full message bodies and stay restricted.
+& icacls.exe $stateRoot /grant '*S-1-5-19:(OI)(CI)(M)' /T /C | Out-Null
 
 & $wrapper install
 if ($LASTEXITCODE -ne 0) { throw "WinSW install failed with exit code $LASTEXITCODE." }

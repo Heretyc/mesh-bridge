@@ -19,6 +19,12 @@ Default paths:
 Directories are created with mode `0700` where the platform honors POSIX modes.
 The JSONL file is opened with mode `0600`.
 
+On Windows the service runs as `NT AUTHORITY\LocalService`, so `scripts/install.ps1`
+pre-creates the `%ProgramData%\Mesh Bridge` state root with its `Logs` and `journal`
+subfolders and grants only that account modify rights. No broad principal (Everyone,
+Users, Authenticated Users) is granted access, keeping the message bodies these files
+contain restricted.
+
 ## Record Shape
 
 Each line is one OTel-shaped log record using OTLP/JSON field spelling:
