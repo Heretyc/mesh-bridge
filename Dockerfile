@@ -13,7 +13,10 @@ FROM node:22-bookworm-slim AS runtime
 ENV NODE_ENV=production
 ENV MESH_BRIDGE_STATE_DIR=/var/lib/mesh-bridge
 WORKDIR /app
-RUN useradd --system --home /var/lib/mesh-bridge --create-home --shell /usr/sbin/nologin meshbridge \
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends udev \
+  && rm -rf /var/lib/apt/lists/* \
+  && useradd --system --home /var/lib/mesh-bridge --create-home --shell /usr/sbin/nologin meshbridge \
   && mkdir -p /var/lib/mesh-bridge \
   && chown -R meshbridge:meshbridge /var/lib/mesh-bridge /app
 COPY --from=builder /app/package*.json ./

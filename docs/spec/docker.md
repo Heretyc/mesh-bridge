@@ -10,7 +10,7 @@ Build the production image:
 docker build -t mesh-bridge .
 ```
 
-The Dockerfile has a builder stage that installs `python3`, `make`, and `g++`, runs `npm ci`, and builds TypeScript. The runtime stage uses the same base image, copies `node_modules` and `dist`, runs as a non-root `meshbridge` user, and sets:
+The Dockerfile has a builder stage that installs `python3`, `make`, and `g++`, runs `npm ci`, and builds TypeScript. The runtime stage uses the same base image, installs `udev` because `serialport` Linux enumeration invokes `udevadm info -e`, copies `node_modules` and `dist`, runs as a non-root `meshbridge` user, and sets:
 
 ```text
 MESH_BRIDGE_STATE_DIR=/var/lib/mesh-bridge
