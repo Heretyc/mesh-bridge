@@ -47,7 +47,40 @@ try {
     $client.Close()
   }
 } catch {
-  Write-Host "send-shutdown: $($_.Exception.Message) (falling back to service stop timeout)"
+  Write-Host "send-shutdown: $($_.Exception.Message) (falling back to forced kill)"
+}
+
+# WinSW 2.12 applies NO stoptimeout around a configured stopexecutable, so this
+# script must own the kill deadline. Regardless of whether the IPC send above
+# succeeded, wait up to 15s for the bridge Node process(es) to exit on their own,
+# then force-kill any that remain. This runs even after a send failure so the
+# stop can never hang.
+try {
+  $Root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
+  # Match only the bridge process for THIS repo: node.exe whose command line
+  # references this worktree's dist\service.js (case-insensitive substring).
+  $needle = (Join-Path $Root 'dist\service.js')
+
+  $deadline = (Get-Date).AddSeconds(15)
+  do {
+    $procs = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'node.exe'" -ErrorAction SilentlyContinue |
+      Where-Object { $_.CommandLine -and $_.CommandLine.ToLower().Contains($needle.ToLower()) })
+    if ($procs.Count -eq 0) { break }
+    Start-Sleep -Milliseconds 500
+  } while ((Get-Date) -lt $deadline)
+
+  $procs = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'node.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -and $_.CommandLine.ToLower().Contains($needle.ToLower()) })
+  foreach ($p in $procs) {
+    try {
+      Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop
+      Write-Host "send-shutdown: force-killed bridge PID $($p.ProcessId)."
+    } catch {
+      Write-Host "send-shutdown: could not kill PID $($p.ProcessId): $($_.Exception.Message)"
+    }
+  }
+} catch {
+  Write-Host "send-shutdown: force-kill phase failed: $($_.Exception.Message)"
 }
 
 exit 0

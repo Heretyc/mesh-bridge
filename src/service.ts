@@ -704,7 +704,14 @@ export class BridgeService {
         close: async () => {
           const graceful = device.disconnect().catch(() => undefined);
           await Promise.race([graceful, delay(1_000)]);
-          await transport.disconnect().catch(() => undefined);
+          // serial disconnect can hang; don't let it eat the stop budget.
+          let timer: NodeJS.Timeout | undefined;
+          const deadline = new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, 3_000);
+            timer.unref();
+          });
+          await Promise.race([transport.disconnect().catch(() => undefined), deadline]);
+          clearTimeout(timer);
         },
       };
       return session;
