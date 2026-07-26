@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -18,7 +19,7 @@ import {
   type User,
 } from "discord.js";
 import { SerialPort } from "serialport";
-import { loadEnvironment, parseConfig, unsafeEnvPermissions, type Config } from "./config.js";
+import { loadConfig, loadEnvironment, unsafeEnvPermissions, type ChannelPairConfig, type Config } from "./config.js";
 import {
   BoundedQueue,
   ReplyCorrelator,
@@ -48,12 +49,18 @@ import {
 import { ChannelJournal } from "./journal.js";
 import { logDir } from "./paths.js";
 import { meshtasticSerialCandidates } from "./serial.js";
-import { IpcServer, StatusStore } from "./status.js";
+import { IpcServer, StatusStore, type StatusSnapshot } from "./status.js";
 import { TelemetrySink } from "./telemetry.js";
+
+// Read once from the runtime image so telemetry never carries a hardcoded/duplicated version.
+// From the built layout this module is dist/service.js, so ../package.json is the repo-root manifest.
+const packageVersion = (JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version;
 
 class FatalConfigurationError extends Error {}
 
 interface DiscordJob {
+  /** Durable route tag: the originating pair's Discord channel id, so the worker never infers a destination. */
+  discordChannelId: string;
   id: string;
   chunks: string[];
   /** Discord message this one natively replies to, resolved to a mesh root only at delivery time. */
@@ -61,6 +68,7 @@ interface DiscordJob {
 }
 
 interface DiscordReactionJob {
+  discordChannelId: string;
   targetDiscordId: string;
   displayName: string;
   emoji: string;
@@ -71,6 +79,7 @@ interface DiscordReactionJob {
 type OutboundJob = DiscordJob | DiscordReactionJob;
 
 interface MeshJob {
+  discordChannelId: string;
   from: number;
   text: string;
   packetId: number;
@@ -78,6 +87,7 @@ interface MeshJob {
 }
 
 interface MeshTapbackJob {
+  discordChannelId: string;
   from: number;
   /** Grapheme handed to the Discord reaction API. */
   emoji: string;
@@ -87,9 +97,18 @@ interface MeshTapbackJob {
 
 type InboundJob = MeshJob | MeshTapbackJob;
 
+/** Per-pair state: config plus this pair's own journal, correlator, resolved Discord handle, and resolved mesh index. */
+interface PairState extends ChannelPairConfig {
+  journal: ChannelJournal;
+  replies: ReplyCorrelator;
+  discordChannel: SendableChannels | undefined;
+  meshChannel: number | undefined;
+}
+
 interface MeshSession {
   device: MeshDevice;
-  channel: number;
+  /** Names resolved against this device's channel list; installed into pairsByMeshChannel only on activation. */
+  resolvedPairs: Array<[number, PairState]>;
   localNode: number;
   disconnected: Promise<void>;
   activate: () => void;
@@ -140,11 +159,12 @@ export class BridgeService {
   private readonly meshToDiscord: BoundedQueue<InboundJob>;
   private readonly discordDedup: TtlDedup;
   private readonly meshDedup: TtlDedup;
-  private readonly journal: ChannelJournal;
-  private readonly replies: ReplyCorrelator;
+  private readonly pairsByDiscordId = new Map<string, PairState>();
+  private readonly pairsByMeshChannel = new Map<number, PairState>();
+  /** Discord channel ids whose journal is currently degraded; aggregate flag clears only when this empties. */
+  private readonly journalDegradedIds = new Set<string>();
   private nodeNames = new Map<number, string>();
   private discord: Client | undefined;
-  private discordChannel: SendableChannels | undefined;
   private mesh: MeshSession | undefined;
   private readonly telemetry: TelemetrySink;
   private lastMeshSend = 0;
@@ -156,7 +176,7 @@ export class BridgeService {
       secrets: [config.discordToken, config.ipcToken],
       resource: {
         "service.name": "mesh-bridge",
-        "service.version": "1.0.0",
+        "service.version": packageVersion,
         "os.type": process.platform === "win32" ? "windows" : process.platform,
         "host.name": hostname(),
       },
@@ -172,16 +192,41 @@ export class BridgeService {
     this.status.useTelemetry(this.telemetry);
     this.discordDedup = new TtlDedup(config.dedupTtlMs, config.queueLimit * 10);
     this.meshDedup = new TtlDedup(config.dedupTtlMs, config.queueLimit * 10);
-    this.journal = new ChannelJournal(config.discordChannelId, {
-      onDegraded: (error) => {
-        this.status.journalDegraded(true, "JOURNAL_WRITE_FAILED", { error: String(error) });
-        process.stderr.write("[Mesh Bridge] warning: reply mapping journal writes failed; continuing with in-memory reply correlation\n");
-      },
-      onRecovered: () => this.status.journalDegraded(false, "JOURNAL_WRITE_RECOVERED"),
-    });
-    this.replies = new ReplyCorrelator(this.journal.meshRootByDiscordId, this.journal.discordIdByMeshId);
+    // One journal + correlator per configured pair; never shared. Degradation is tracked per Discord id so
+    // one recovered journal cannot clear the aggregate flag while another journal is still failing.
+    for (const pair of config.channels) {
+      const journal = new ChannelJournal(pair.discordChannelId, {
+        onDegraded: (error) => {
+          this.journalDegradedIds.add(pair.discordChannelId);
+          this.status.journalDegraded(true, "JOURNAL_WRITE_FAILED", { error: String(error), discordChannelId: pair.discordChannelId });
+          process.stderr.write("[Mesh Bridge] warning: reply mapping journal writes failed; continuing with in-memory reply correlation\n");
+        },
+        onRecovered: () => {
+          this.journalDegradedIds.delete(pair.discordChannelId);
+          if (this.journalDegradedIds.size === 0) this.status.journalDegraded(false, "JOURNAL_WRITE_RECOVERED");
+        },
+      });
+      this.pairsByDiscordId.set(pair.discordChannelId, {
+        discordChannelId: pair.discordChannelId,
+        meshtasticChannelName: pair.meshtasticChannelName,
+        journal,
+        replies: new ReplyCorrelator(journal.meshRootByDiscordId, journal.discordIdByMeshId),
+        discordChannel: undefined,
+        meshChannel: undefined,
+      });
+    }
+    this.status.connection({ channelPairs: this.channelPairsStatus() });
     this.discordToMesh = new BoundedQueue(config.queueLimit, (depth) => this.status.queue("discordToMesh", depth));
     this.meshToDiscord = new BoundedQueue(config.queueLimit, (depth) => this.status.queue("meshToDiscord", depth));
+  }
+
+  /** Every configured pair with its current resolved mesh index (null = pending), for the status payload. */
+  private channelPairsStatus(): StatusSnapshot["connections"]["channelPairs"] {
+    return [...this.pairsByDiscordId.values()].map((pair) => ({
+      discordChannelId: pair.discordChannelId,
+      meshtasticChannelName: pair.meshtasticChannelName,
+      meshChannelIndex: pair.meshChannel ?? null,
+    }));
   }
 
   public async run(): Promise<void> {
@@ -265,15 +310,21 @@ export class BridgeService {
         if (client.user?.username !== "Mesh Bridge") {
           throw new FatalConfigurationError(`Discord bot username must be exactly "Mesh Bridge"; found "${client.user?.username ?? "unknown"}"`);
         }
-        const channel = await client.channels.fetch(this.config.discordChannelId);
-        if (!channel || !channel.isSendable() || channel.isDMBased()) {
-          throw new FatalConfigurationError("DISCORD_CHANNEL_ID is not a sendable server channel visible to Mesh Bridge");
+        // Validate every configured Discord channel before wiring any handle, so a mid-list failure never
+        // leaves a half-populated routing table behind a client that is about to be destroyed.
+        const resolved: Array<[PairState, SendableChannels]> = [];
+        for (const pair of this.pairsByDiscordId.values()) {
+          const channel = await client.channels.fetch(pair.discordChannelId);
+          if (!channel || !channel.isSendable() || channel.isDMBased()) {
+            throw new FatalConfigurationError(`Discord channel ${JSON.stringify(pair.discordChannelId)} is not a sendable server channel visible to Mesh Bridge`);
+          }
+          if (!hasRequiredDiscordPermissions(channel.permissionsFor(client.user))) {
+            throw new FatalConfigurationError(`Mesh Bridge needs View Channel, Send Messages, Read Message History, and Add Reactions in Discord channel ${JSON.stringify(pair.discordChannelId)}`);
+          }
+          resolved.push([pair, channel]);
         }
-        if (!hasRequiredDiscordPermissions(channel.permissionsFor(client.user))) {
-          throw new FatalConfigurationError("Mesh Bridge needs only View Channel, Send Messages, Read Message History, and Add Reactions in DISCORD_CHANNEL_ID");
-        }
+        for (const [pair, channel] of resolved) pair.discordChannel = channel;
         this.discord = client;
-        this.discordChannel = channel;
         this.status.link("discord", "online");
         this.status.event("info", "DISCORD_CONNECTED");
         attempt = 0;
@@ -287,7 +338,7 @@ export class BridgeService {
       } finally {
         if (this.discord === client) {
           this.discord = undefined;
-          this.discordChannel = undefined;
+          for (const pair of this.pairsByDiscordId.values()) pair.discordChannel = undefined;
         }
         client.destroy();
       }
@@ -311,6 +362,9 @@ export class BridgeService {
   }
 
   private async handleDiscordMessage(message: Message): Promise<void> {
+    // Route by channel id before any body work: an unconfigured channel is ignored outright.
+    const pair = this.pairsByDiscordId.get(message.channelId);
+    if (pair === undefined) return;
     // Resolve mentions before attachments and chunking so the substituted names are charged to the 232-byte ceiling.
     const body = discordMessageBody(message);
     const ordinary = message.type === MessageType.Default || message.type === MessageType.Reply;
@@ -320,13 +374,14 @@ export class BridgeService {
       webhookId: message.webhookId,
       ordinary,
       hasBody: body.length > 0,
-    }, this.config.discordChannelId)) return;
-    if (this.discordDedup.seen(`discord:${message.id}`)) return;
+    }, pair.discordChannelId)) return;
+    if (this.discordDedup.seen(`discord:${pair.discordChannelId}:${message.id}`)) return;
 
     this.status.count("discordReceived");
     this.telemetry.logMessageBody("discord->mesh", body, { discordId: message.id });
     const displayName = message.member?.displayName ?? message.author.globalName ?? message.author.username;
     const job: DiscordJob = {
+      discordChannelId: pair.discordChannelId,
       id: message.id,
       chunks: splitDiscordForMesh(displayName, body),
       replyToDiscordId: message.reference?.messageId,
@@ -334,7 +389,7 @@ export class BridgeService {
     if (!this.discordToMesh.enqueue(job)) {
       this.status.count("rejected");
       this.status.event("error", "DISCORD_TO_MESH_QUEUE_FULL", { discordId: message.id });
-      await this.reportDiscord("Mesh Bridge: message was not queued because the mesh queue is full.");
+      await this.reportDiscord(pair.discordChannelId, "Mesh Bridge: message was not queued because the mesh queue is full.");
     }
   }
 
@@ -343,12 +398,13 @@ export class BridgeService {
     user: User | PartialUser,
   ): Promise<void> {
     // Reject other channels before resolving partials, but fetch a partial user before trusting its bot identity.
-    if (reaction.message.channelId !== this.config.discordChannelId) return;
+    const pair = this.pairsByDiscordId.get(reaction.message.channelId);
+    if (pair === undefined) return;
     const reactor = user.partial ? await user.fetch() : user;
     if (!shouldForwardDiscordReaction({
       channelId: reaction.message.channelId,
       reactorBot: reactor.bot,
-    }, this.config.discordChannelId)) return;
+    }, pair.discordChannelId)) return;
 
     const fullReaction = reaction.partial ? await reaction.fetch() : reaction;
     const message = fullReaction.message.partial ? await fullReaction.message.fetch() : fullReaction.message;
@@ -359,6 +415,7 @@ export class BridgeService {
 
     this.status.count("discordReceived");
     const job: DiscordReactionJob = {
+      discordChannelId: pair.discordChannelId,
       targetDiscordId: message.id,
       displayName,
       emoji: discordReactionDisplay({ id: fullReaction.emoji.id, name: fullReaction.emoji.name }),
@@ -370,13 +427,15 @@ export class BridgeService {
     if (!this.discordToMesh.enqueue(job)) {
       this.status.count("rejected");
       this.status.event("error", "DISCORD_TO_MESH_QUEUE_FULL", { kind: "reaction", referencedId: message.id });
-      await this.reportDiscord("Mesh Bridge: reaction was not queued because the mesh queue is full.");
+      await this.reportDiscord(pair.discordChannelId, "Mesh Bridge: reaction was not queued because the mesh queue is full.");
     }
   }
 
   private async deliverDiscordToMesh(job: DiscordJob): Promise<void> {
+    const pair = this.pairsByDiscordId.get(job.discordChannelId);
+    if (pair === undefined) return;
     // Resolved at delivery time so FIFO ordering decides whether the target has been correlated yet.
-    const meshRoot = this.replies.meshRootFor(job.replyToDiscordId);
+    const meshRoot = pair.replies.meshRootFor(job.replyToDiscordId);
     if (job.replyToDiscordId !== undefined && meshRoot === undefined) {
       this.status.event("warn", "REPLY_TARGET_UNAVAILABLE", { direction: "discordToMesh", referencedId: job.replyToDiscordId });
     }
@@ -385,10 +444,11 @@ export class BridgeService {
     for (const [index, chunk] of job.chunks.entries()) {
       try {
         const packetId = await retry(async () => {
-          const session = await this.waitForMesh();
+          // Re-resolve the job's own pair each attempt so a reconnect that changes the session or index is honored.
+          const { session, channel } = await this.waitForMesh(job.discordChannelId);
           await this.waitForMeshSendSlot();
           return Promise.race([
-            session.device.sendText(chunk, "broadcast", true, session.channel as Types.ChannelNumber, replyIdForChunk(index, meshRoot)),
+            session.device.sendText(chunk, "broadcast", true, channel as Types.ChannelNumber, replyIdForChunk(index, meshRoot)),
             session.disconnected.then<never>(() => Promise.reject(new Error("Meshtastic disconnected before ACK"))),
             delay(65_000, this.abort.signal).then<never>(() => Promise.reject(new Error("Meshtastic ACK timeout"))),
           ]);
@@ -397,7 +457,7 @@ export class BridgeService {
           this.status.event("warn", "MESH_SEND_RETRY", { discordId: job.id, chunk: index + 1 });
         });
         // Every chunk maps back to the Discord message; only chunk 1 becomes that message's canonical mesh root.
-        this.replies.recordOutboundChunk(job.id, index, packetId);
+        pair.replies.recordOutboundChunk(job.id, index, packetId);
         delivered += 1;
         this.status.count("meshSent");
         this.telemetry.logMessageBody("discord->mesh", chunk, { discordId: job.id, chunk: index + 1, packetId });
@@ -411,15 +471,17 @@ export class BridgeService {
           reason: reason(error),
         });
         const kind = delivered === 0 ? "failed" : "partially failed";
-        await this.reportDiscord(`Mesh Bridge: mesh delivery ${kind}; ${delivered}/${job.chunks.length} chunks acknowledged.`);
+        await this.reportDiscord(job.discordChannelId, `Mesh Bridge: mesh delivery ${kind}; ${delivered}/${job.chunks.length} chunks acknowledged.`);
         return;
       }
     }
   }
 
   private async deliverDiscordReactionToMesh(job: DiscordReactionJob): Promise<void> {
+    const pair = this.pairsByDiscordId.get(job.discordChannelId);
+    if (pair === undefined) return;
     // Resolve at delivery time so a just-queued bridge message can establish its ACKed root first.
-    const meshRoot = this.replies.meshRootFor(job.targetDiscordId);
+    const meshRoot = pair.replies.meshRootFor(job.targetDiscordId);
     let text: string;
     try {
       text = meshRoot === undefined
@@ -428,16 +490,16 @@ export class BridgeService {
     } catch (error) {
       this.status.count("failures");
       this.status.event("error", "MESH_REACTION_FORMAT_FAILED", { referencedId: job.targetDiscordId, reason: reason(error) });
-      await this.reportDiscord("Mesh Bridge: reaction delivery failed; 0/1 packets acknowledged.");
+      await this.reportDiscord(job.discordChannelId, "Mesh Bridge: reaction delivery failed; 0/1 packets acknowledged.");
       return;
     }
 
     try {
       const packetId = await retry(async () => {
-        const session = await this.waitForMesh();
+        const { session, channel } = await this.waitForMesh(job.discordChannelId);
         await this.waitForMeshSendSlot();
         return Promise.race([
-          session.device.sendText(text, "broadcast", true, session.channel as Types.ChannelNumber, meshRoot),
+          session.device.sendText(text, "broadcast", true, channel as Types.ChannelNumber, meshRoot),
           session.disconnected.then<never>(() => Promise.reject(new Error("Meshtastic disconnected before ACK"))),
           delay(65_000, this.abort.signal).then<never>(() => Promise.reject(new Error("Meshtastic ACK timeout"))),
         ]);
@@ -445,14 +507,14 @@ export class BridgeService {
         this.status.count("retries");
         this.status.event("warn", "MESH_REACTION_SEND_RETRY", { referencedId: job.targetDiscordId, attempt });
       });
-      this.replies.aliasMeshPacket(packetId, job.targetDiscordId);
+      pair.replies.aliasMeshPacket(packetId, job.targetDiscordId);
       this.status.count("meshSent");
       this.telemetry.logMessageBody("discord->mesh.reaction", text, { referencedId: job.targetDiscordId, targetBody: job.targetBody, packetId });
     } catch {
       if (this.abort.signal.aborted) return;
       this.status.count("failures");
       this.status.event("error", "MESH_REACTION_DELIVERY_FAILED", { delivered: 0, total: 1 });
-      await this.reportDiscord("Mesh Bridge: reaction delivery failed; 0/1 packets acknowledged.");
+      await this.reportDiscord(job.discordChannelId, "Mesh Bridge: reaction delivery failed; 0/1 packets acknowledged.");
     }
   }
 
@@ -470,7 +532,7 @@ export class BridgeService {
         const session = await this.openMesh();
         this.mesh = session;
         this.status.link("meshtastic", "online");
-        this.status.event("info", "MESHTASTIC_CONNECTED", { channel: session.channel });
+        this.status.event("info", "MESHTASTIC_CONNECTED", { channels: session.resolvedPairs.map(([index]) => index) });
         attempt = 0;
         await Promise.race([session.disconnected, abortPromise(this.abort.signal)]);
       } catch (error) {
@@ -483,7 +545,10 @@ export class BridgeService {
         const session = this.mesh;
         this.mesh = undefined;
         if (session) await session.close().catch(() => undefined);
-        this.status.connection({ serialPort: "-", localNode: "-", meshChannel: "-" });
+        // Tear down mesh->discord routing but keep every configured pair row, now shown as pending.
+        this.pairsByMeshChannel.clear();
+        for (const pair of this.pairsByDiscordId.values()) pair.meshChannel = undefined;
+        this.status.connection({ serialPort: "-", localNode: "-", channelPairs: this.channelPairsStatus() });
       }
       if (!this.abort.signal.aborted) await delay(backoff(attempt++), this.abort.signal);
     }
@@ -563,26 +628,52 @@ export class BridgeService {
       });
 
       if (localNode === 0) throw new FatalConfigurationError("Meshtastic configuration did not provide a local node ID");
-      const channel = resolveEncryptedChannel(channels.map((entry) => ({
+      const candidates = channels.map((entry) => ({
         index: entry.index,
         role: entry.role,
         name: entry.settings?.name ?? "",
         psk: entry.settings?.psk ?? new Uint8Array(),
-      })), this.config.meshChannelName);
+      }));
+      // Resolve every configured pair against this device. A name absent from the device leaves its pair
+      // pending (no Mesh->Discord traffic); two names sharing one index is an immediate startup failure.
+      const resolvedPairs: Array<[number, PairState]> = [];
+      const ownerByIndex = new Map<number, PairState>();
+      for (const pair of this.pairsByDiscordId.values()) {
+        let index: number;
+        try {
+          index = resolveEncryptedChannel(candidates, pair.meshtasticChannelName);
+        } catch (error) {
+          if (/was not found/i.test(reason(error))) continue; // pending: name absent from this device's channel list
+          throw error; // ambiguous / invalid index / unencrypted remain fatal (converted by the outer catch)
+        }
+        const owner = ownerByIndex.get(index);
+        if (owner !== undefined) {
+          throw new FatalConfigurationError(
+            `Meshtastic channel name collision: ${JSON.stringify(owner.meshtasticChannelName)} and ${JSON.stringify(pair.meshtasticChannelName)} both resolve to device channel index ${index}`,
+          );
+        }
+        ownerByIndex.set(index, pair);
+        resolvedPairs.push([index, pair]);
+      }
       const session: MeshSession = {
         device,
-        channel,
+        resolvedPairs,
         localNode,
         disconnected,
         activate: () => {
           this.nodeNames = nodeNames;
+          // Install routing BEFORE draining the startup buffer so pre-activation packets route, not drop.
+          for (const [index, pair] of resolvedPairs) {
+            pair.meshChannel = index;
+            this.pairsByMeshChannel.set(index, pair);
+          }
           routePacket = (packet) => this.handleMeshPacket(packet, session);
           pending.splice(0).forEach(routePacket);
           device.setHeartbeatInterval(300_000);
           this.status.connection({
             serialPort: serialPath,
             localNode: `!${localNode.toString(16).padStart(8, "0")}`,
-            meshChannel: String(channel),
+            channelPairs: this.channelPairsStatus(),
           });
         },
         close: async () => {
@@ -600,6 +691,9 @@ export class BridgeService {
   }
 
   private handleMeshPacket(packet: Protobuf.Mesh.MeshPacket, session: MeshSession): void {
+    // Route by mesh channel index before decode or dedup: an unconfigured/pending index is ignored.
+    const pair = this.pairsByMeshChannel.get(packet.channel);
+    if (pair === undefined) return;
     if (packet.payloadVariant.case !== "decoded") return;
     const data = packet.payloadVariant.value;
     if (!shouldForwardMesh({
@@ -607,11 +701,12 @@ export class BridgeService {
       channel: packet.channel,
       from: packet.from,
       destination: packet.to === Constants.broadcastNum ? "broadcast" : "direct",
-    }, session.channel, session.localNode)) return;
+    }, packet.channel, session.localNode)) return;
+    // Dedup keys carry the pair's Discord id so the same packet id on two mesh channels never collides.
     const fallback = createHash("sha256").update(data.payload).digest("hex").slice(0, 16);
     const dedupKey = packet.id === 0
-      ? `mesh:${packet.from}:0:${packet.rxTime}:${fallback}`
-      : `mesh:${packet.from}:${packet.id}`;
+      ? `mesh:${pair.discordChannelId}:${packet.from}:0:${packet.rxTime}:${fallback}`
+      : `mesh:${pair.discordChannelId}:${packet.from}:${packet.id}`;
     if (this.meshDedup.seen(dedupKey)) return;
 
     let text: string;
@@ -632,23 +727,25 @@ export class BridgeService {
         this.status.event("error", "MESH_TAPBACK_INVALID", { from: packet.from, packetId: packet.id, referencedId: data.replyId });
         return;
       }
-      if (!this.meshToDiscord.enqueue({ from: packet.from, emoji, packetId: packet.id, replyId: data.replyId })) {
+      if (!this.meshToDiscord.enqueue({ discordChannelId: pair.discordChannelId, from: packet.from, emoji, packetId: packet.id, replyId: data.replyId })) {
         this.status.count("rejected");
         this.status.event("error", "MESH_TO_DISCORD_QUEUE_FULL", { from: packet.from, packetId: packet.id, kind: "reaction" });
       }
       return;
     }
     this.telemetry.logMessageBody("mesh->discord", text, { from: packet.from, packetId: packet.id, replyId: data.replyId });
-    if (!this.meshToDiscord.enqueue({ from: packet.from, text, packetId: packet.id, replyId: data.replyId })) {
+    if (!this.meshToDiscord.enqueue({ discordChannelId: pair.discordChannelId, from: packet.from, text, packetId: packet.id, replyId: data.replyId })) {
       this.status.count("rejected");
       this.status.event("error", "MESH_TO_DISCORD_QUEUE_FULL", { from: packet.from, packetId: packet.id });
     }
   }
 
   private async deliverMeshToDiscord(job: MeshJob): Promise<void> {
-    const channel = await this.waitForDiscord();
+    const pair = this.pairsByDiscordId.get(job.discordChannelId);
+    if (pair === undefined) return;
+    const channel = await this.waitForDiscord(job.discordChannelId);
     const name = this.nodeNames.get(job.from) ?? `Unknown !${job.from.toString(16).padStart(8, "0")}`;
-    const target = this.replies.discordTargetFor(job.replyId);
+    const target = pair.replies.discordTargetFor(job.replyId);
     if (job.replyId !== 0 && target === undefined) {
       this.status.event("warn", "REPLY_TARGET_UNAVAILABLE", { direction: "meshToDiscord", referencedId: job.replyId });
     }
@@ -663,7 +760,7 @@ export class BridgeService {
       if (target !== undefined && sent.reference?.messageId !== target) {
         this.status.event("warn", "REPLY_TARGET_UNAVAILABLE", { direction: "meshToDiscord", referencedId: job.replyId });
       }
-      this.replies.recordInbound(job.packetId, sent.id);
+      pair.replies.recordInbound(job.packetId, sent.id);
       this.status.count("discordSent");
       this.telemetry.logMessageBody("mesh->discord", content, { from: job.from, packetId: job.packetId, discordId: sent.id });
     } catch (error) {
@@ -674,16 +771,18 @@ export class BridgeService {
   }
 
   private async deliverMeshTapbackToDiscord(job: MeshTapbackJob): Promise<void> {
-    const target = this.replies.discordTargetFor(job.replyId);
+    const pair = this.pairsByDiscordId.get(job.discordChannelId);
+    if (pair === undefined) return;
+    const target = pair.replies.discordTargetFor(job.replyId);
     if (target === undefined) {
       this.status.count("failures");
       this.status.event("error", "DISCORD_REACTION_TARGET_UNAVAILABLE", { direction: "meshToDiscord", referencedId: job.replyId });
       return;
     }
     // A reply to this tapback packet should still thread onto the message that was reacted to.
-    this.replies.aliasMeshPacket(job.packetId, target);
+    pair.replies.aliasMeshPacket(job.packetId, target);
     try {
-      const channel = await this.waitForDiscord();
+      const channel = await this.waitForDiscord(job.discordChannelId);
       const message = await channel.messages.fetch(target);
       await message.react(job.emoji);
       this.status.count("discordSent");
@@ -695,22 +794,30 @@ export class BridgeService {
     }
   }
 
-  private async waitForMesh(): Promise<MeshSession> {
-    while (!this.mesh) await delay(250, this.abort.signal);
-    return this.mesh;
+  /** Wait for the shared mesh session AND this pair's resolved index; both are required to send Discord->mesh. */
+  private async waitForMesh(discordChannelId: string): Promise<{ session: MeshSession; channel: number }> {
+    for (;;) {
+      const session = this.mesh;
+      const meshChannel = this.pairsByDiscordId.get(discordChannelId)?.meshChannel;
+      if (session && meshChannel !== undefined) return { session, channel: meshChannel };
+      await delay(250, this.abort.signal);
+    }
   }
 
-  private async waitForDiscord(): Promise<SendableChannels> {
-    while (!this.discordChannel) await delay(250, this.abort.signal);
-    return this.discordChannel;
+  private async waitForDiscord(discordChannelId: string): Promise<SendableChannels> {
+    for (;;) {
+      const channel = this.pairsByDiscordId.get(discordChannelId)?.discordChannel;
+      if (channel) return channel;
+      await delay(250, this.abort.signal);
+    }
   }
 
-  private async reportDiscord(content: string): Promise<void> {
+  private async reportDiscord(discordChannelId: string, content: string): Promise<void> {
     try {
-      const channel = await this.waitForDiscord();
+      const channel = await this.waitForDiscord(discordChannelId);
       await channel.send({ content, allowedMentions });
     } catch (error) {
-      if (!this.abort.signal.aborted) this.status.event("error", "FAILURE_REPORT_UNDELIVERED");
+      if (!this.abort.signal.aborted) this.status.event("error", "FAILURE_REPORT_UNDELIVERED", { discordChannelId });
     }
   }
 
@@ -721,7 +828,7 @@ export class BridgeService {
     this.discord?.destroy();
     await this.mesh?.close().catch(() => undefined);
     await this.ipc.close();
-    this.journal.close();
+    for (const pair of this.pairsByDiscordId.values()) pair.journal.close();
     this.telemetry.close();
   }
 }
@@ -729,7 +836,7 @@ export class BridgeService {
 async function main(): Promise<void> {
   try {
     const envPath = loadEnvironment();
-    const config = parseConfig(process.env);
+    const config = loadConfig();
     const service = new BridgeService(config);
     for (const warning of unsafeEnvPermissions(envPath)) {
       service.status.event("warn", "UNSAFE_ENV_PERMISSIONS", { acl: warning });
