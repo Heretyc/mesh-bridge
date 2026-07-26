@@ -24,7 +24,7 @@ managed block, which must be preserved verbatim when present.`;
 
 // One Load Trigger is registered in AGENTS.md for every non-AGENTS Markdown doc.
 // Keep this in sync with the AGENTS.md "Load Triggers" section.
-const EXPECTED_NON_AGENTS_MARKDOWN = 23;
+const EXPECTED_NON_AGENTS_MARKDOWN = 24;
 
 const root = process.cwd();
 const failures = [];
@@ -67,7 +67,7 @@ function checkFile(file) {
 
   if (POINTER_FILES.has(basename)) {
     const expected = POINTER_TEMPLATE.replace('{BASENAME}', basename).trim();
-    const actual = stripManagedBlock(buffer.toString('utf8')).trim();
+    const actual = stripManagedBlock(buffer.toString('utf8').replace(/\r\n/g, '\n')).trim();
     if (actual !== expected) {
       failures.push(`FAIL ${rel(file)}: pointer file content is not canonical`);
     }
