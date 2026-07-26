@@ -28,36 +28,48 @@ import {
   visibleDiscordReactionTarget,
 } from "./logic.js";
 
+const DISCORD_CHANNEL_ID = "123456789012345678";
+
+// Secrets only now live in the environment; channel pairs and tuning moved into config.jsonc (two-arg parseConfig).
 const validEnv: NodeJS.ProcessEnv = {
   DISCORD_TOKEN: "a".repeat(40),
-  DISCORD_CHANNEL_ID: "123456789012345678",
-  MESHTASTIC_CHANNEL_NAME: "private",
   IPC_TOKEN: "b".repeat(64),
 };
 
+// Minimal valid config.jsonc source with one channel pair; overrides merge onto the root object.
+function configSource(overrides: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    channels: [{ discordChannelId: DISCORD_CHANNEL_ID, meshtasticChannelName: "private" }],
+    ...overrides,
+  });
+}
+
 test("configuration validates required secrets and bounded values", () => {
-  assert.equal(parseConfig(validEnv).queueLimit, 100);
-  assert.throws(() => parseConfig({ ...validEnv, DISCORD_TOKEN: "replace-me" }), /DISCORD_TOKEN/u);
-  assert.throws(() => parseConfig({ ...validEnv, MESHTASTIC_CHANNEL_NAME: "😀😀😀" }), /11 UTF-8 bytes/u);
-  assert.throws(() => parseConfig({ ...validEnv, QUEUE_LIMIT: "0" }), /QUEUE_LIMIT/u);
+  assert.equal(parseConfig(validEnv, configSource()).queueLimit, 100);
+  assert.throws(() => parseConfig({ ...validEnv, DISCORD_TOKEN: "replace-me" }, configSource()), /DISCORD_TOKEN/u);
+  assert.throws(
+    () => parseConfig(validEnv, JSON.stringify({ channels: [{ discordChannelId: DISCORD_CHANNEL_ID, meshtasticChannelName: "😀😀😀" }] })),
+    /11 UTF-8 bytes/u,
+  );
+  assert.throws(() => parseConfig(validEnv, configSource({ queueLimit: 0 })), /queueLimit must be an integer from 1 to 1000/u);
 });
 
 test("Discord routing accepts ordinary configured-channel users only", () => {
-  const base = { channelId: validEnv.DISCORD_CHANNEL_ID!, authorBot: false, webhookId: null, ordinary: true, hasBody: true };
-  assert.equal(shouldForwardDiscord(base, validEnv.DISCORD_CHANNEL_ID!), true);
-  assert.equal(shouldForwardDiscord({ ...base, channelId: "999999999999999999" }, validEnv.DISCORD_CHANNEL_ID!), false);
-  assert.equal(shouldForwardDiscord({ ...base, authorBot: true }, validEnv.DISCORD_CHANNEL_ID!), false);
-  assert.equal(shouldForwardDiscord({ ...base, webhookId: "123" }, validEnv.DISCORD_CHANNEL_ID!), false);
-  assert.equal(shouldForwardDiscord({ ...base, ordinary: false }, validEnv.DISCORD_CHANNEL_ID!), false);
-  assert.equal(shouldForwardDiscord({ ...base, hasBody: false }, validEnv.DISCORD_CHANNEL_ID!), false);
+  const base = { channelId: DISCORD_CHANNEL_ID, authorBot: false, webhookId: null, ordinary: true, hasBody: true };
+  assert.equal(shouldForwardDiscord(base, DISCORD_CHANNEL_ID), true);
+  assert.equal(shouldForwardDiscord({ ...base, channelId: "999999999999999999" }, DISCORD_CHANNEL_ID), false);
+  assert.equal(shouldForwardDiscord({ ...base, authorBot: true }, DISCORD_CHANNEL_ID), false);
+  assert.equal(shouldForwardDiscord({ ...base, webhookId: "123" }, DISCORD_CHANNEL_ID), false);
+  assert.equal(shouldForwardDiscord({ ...base, ordinary: false }, DISCORD_CHANNEL_ID), false);
+  assert.equal(shouldForwardDiscord({ ...base, hasBody: false }, DISCORD_CHANNEL_ID), false);
   assert.equal(safeAttachmentName("C:\\fake\\photo.JPG"), "photo.JPG");
 });
 
 test("Discord reaction routing accepts configured-channel users only", () => {
-  const base = { channelId: validEnv.DISCORD_CHANNEL_ID!, reactorBot: false };
-  assert.equal(shouldForwardDiscordReaction(base, validEnv.DISCORD_CHANNEL_ID!), true);
-  assert.equal(shouldForwardDiscordReaction({ ...base, channelId: "999999999999999999" }, validEnv.DISCORD_CHANNEL_ID!), false);
-  assert.equal(shouldForwardDiscordReaction({ ...base, reactorBot: true }, validEnv.DISCORD_CHANNEL_ID!), false);
+  const base = { channelId: DISCORD_CHANNEL_ID, reactorBot: false };
+  assert.equal(shouldForwardDiscordReaction(base, DISCORD_CHANNEL_ID), true);
+  assert.equal(shouldForwardDiscordReaction({ ...base, channelId: "999999999999999999" }, DISCORD_CHANNEL_ID), false);
+  assert.equal(shouldForwardDiscordReaction({ ...base, reactorBot: true }, DISCORD_CHANNEL_ID), false);
 });
 
 test("Discord reactions format Unicode and custom emoji as one text packet", () => {

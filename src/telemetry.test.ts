@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+// service.version is read from package.json at runtime (see docs/spec/bridge-config.md "Version Telemetry"),
+// so tests must derive the expected version from the same manifest instead of hardcoding it.
+const packageVersion = (JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version;
 import { join, posix, win32 } from "node:path";
 import test, { type TestContext } from "node:test";
 import { appendJsonl, atomicReplaceFile, readJsonlTolerant } from "./jsonl.js";
@@ -23,7 +26,7 @@ function sandbox(t: TestContext): string {
 }
 
 function resource(): Record<string, string> {
-  return { "service.name": "mesh-bridge", "service.version": "1.0.0", "os.type": "test", "host.name": "host" };
+  return { "service.name": "mesh-bridge", "service.version": packageVersion, "os.type": "test", "host.name": "host" };
 }
 
 function lines(path: string): string[] {
@@ -39,7 +42,7 @@ function recordAt(ms: number, body = "body"): unknown {
     body: { stringValue: body },
     attributes: [],
     resource: { attributes: [] },
-    instrumentationScope: { name: "mesh-bridge", version: "1.0.0" },
+    instrumentationScope: { name: "mesh-bridge", version: packageVersion },
     eventName: "message",
   };
 }

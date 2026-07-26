@@ -6,12 +6,16 @@ import test, { type TestContext } from "node:test";
 import type { Config } from "./config.js";
 import { ReplyCorrelator, splitDiscordForMesh } from "./logic.js";
 import { BridgeService } from "./service.js";
-import type { StatusStore } from "./status.js";
+import type { StatusStore, StatusSnapshot } from "./status.js";
+
+// service.version is read from package.json at runtime; tests derive it from the same manifest, never hardcode it.
+const packageVersion = (JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version;
+
+const CHANNEL_A = "123456789012345678";
+const CHANNEL_B = "223456789012345678";
 
 const config: Config = {
   discordToken: "t".repeat(40),
-  discordChannelId: "123456789012345678",
-  meshChannelName: "private",
   ipcToken: "i".repeat(64),
   ipcPort: 47_999, // never listened on: these tests drive delivery methods directly, never run().
   queueLimit: 10,
@@ -19,12 +23,43 @@ const config: Config = {
   sendIntervalMs: 0,
   configTimeoutMs: 5_000,
   dedupTtlMs: 60_000,
+  channels: [{ discordChannelId: CHANNEL_A, meshtasticChannelName: "private" }],
 };
+
+// Two-pair fixture for the multi-channel isolation tests; each pair resolves to a distinct device index.
+const twoPairChannels = [
+  { discordChannelId: CHANNEL_A, meshtasticChannelName: "alpha" },
+  { discordChannelId: CHANNEL_B, meshtasticChannelName: "bravo" },
+];
+
+interface DiscordChannelStub {
+  send: (options: Record<string, unknown>) => Promise<{ id: string; reference: { messageId: string } | null }>;
+  messages?: { fetch: (id: string) => Promise<{ react: (emoji: string) => Promise<unknown> }> };
+}
+
+interface MeshSessionStub {
+  device: { sendText: (...args: unknown[]) => Promise<number> };
+  localNode: number;
+  disconnected: Promise<void>;
+}
+
+// Per-pair state now owns the journal, correlator, resolved Discord handle, and resolved mesh index.
+interface PairInternals {
+  discordChannelId: string;
+  meshtasticChannelName: string;
+  replies: ReplyCorrelator;
+  discordChannel: DiscordChannelStub | undefined;
+  meshChannel: number | undefined;
+  journal: { file: string };
+}
 
 interface Internals {
   status: StatusStore;
-  replies: ReplyCorrelator;
   abort: AbortController;
+  pairsByDiscordId: Map<string, PairInternals>;
+  pairsByMeshChannel: Map<number, PairInternals>;
+  mesh: MeshSessionStub | undefined;
+  channelPairsStatus(): StatusSnapshot["connections"]["channelPairs"];
   discordToMesh: {
     start(worker: (job: ReactionJob) => Promise<void>): void;
     drain(timeoutMs: number): Promise<boolean>;
@@ -33,15 +68,10 @@ interface Internals {
     start(worker: (job: MeshTapbackJob) => Promise<void>): void;
     drain(timeoutMs: number): Promise<boolean>;
   };
-  mesh: { device: { sendText: (...args: unknown[]) => Promise<number> }; channel: number; localNode: number; disconnected: Promise<void> } | undefined;
-  discordChannel: {
-    send: (options: Record<string, unknown>) => Promise<{ id: string; reference: { messageId: string } | null }>;
-    messages?: { fetch: (id: string) => Promise<{ react: (emoji: string) => Promise<unknown> }> };
-  } | undefined;
   deliverOutbound(job: ReactionJob): Promise<void>;
   deliverInbound(job: MeshTapbackJob): Promise<void>;
-  deliverDiscordToMesh(job: { id: string; chunks: string[]; replyToDiscordId: string | undefined }): Promise<void>;
-  deliverMeshToDiscord(job: { from: number; text: string; packetId: number; replyId: number }): Promise<void>;
+  deliverDiscordToMesh(job: { discordChannelId: string; id: string; chunks: string[]; replyToDiscordId: string | undefined }): Promise<void>;
+  deliverMeshToDiscord(job: { discordChannelId: string; from: number; text: string; packetId: number; replyId: number }): Promise<void>;
   deliverDiscordReactionToMesh(job: ReactionJob): Promise<void>;
   deliverMeshTapbackToDiscord(job: MeshTapbackJob): Promise<void>;
   handleDiscordReaction(reaction: unknown, user: unknown): Promise<void>;
@@ -52,6 +82,7 @@ interface Internals {
 }
 
 interface ReactionJob {
+  discordChannelId: string;
   targetDiscordId: string;
   displayName: string;
   emoji: string;
@@ -59,6 +90,7 @@ interface ReactionJob {
 }
 
 interface MeshTapbackJob {
+  discordChannelId: string;
   from: number;
   emoji: string;
   packetId: number;
@@ -74,6 +106,7 @@ function newService(t: TestContext, overrides: Partial<Config> = {}): Internals 
   t.after(() => {
     internals.telemetry.close();
     internals.abort.abort(new Error("test finished")); // clears each send's 65s ACK timer
+    for (const pair of internals.pairsByDiscordId.values()) (pair as unknown as { journal: { close(): void } }).journal.close();
     if (previous === undefined) delete process.env.MESH_BRIDGE_STATE_DIR;
     else process.env.MESH_BRIDGE_STATE_DIR = previous;
     rmSync(stateDir, { recursive: true, force: true });
@@ -81,24 +114,37 @@ function newService(t: TestContext, overrides: Partial<Config> = {}): Internals 
   return internals;
 }
 
+function pairOf(internals: Internals, id = CHANNEL_A): PairInternals {
+  const pair = internals.pairsByDiscordId.get(id);
+  assert.ok(pair, `pair ${id} must exist`);
+  return pair;
+}
+
+// Map a resolved mesh channel index to a pair, mirroring the routing table that MeshSession.activate() installs.
+function mapMeshChannel(internals: Internals, index: number, id = CHANNEL_A): PairInternals {
+  const pair = pairOf(internals, id);
+  pair.meshChannel = index;
+  internals.pairsByMeshChannel.set(index, pair);
+  return pair;
+}
+
+// One shared radio/transmitter for the whole bridge; wire it plus this pair's resolved index for outbound sends.
+function attachMesh(internals: Internals, sendText: (...args: unknown[]) => Promise<number>, index = 3, id = CHANNEL_A): MeshSessionStub {
+  const session: MeshSessionStub = { device: { sendText }, localNode: 7, disconnected: new Promise<void>(() => undefined) };
+  internals.mesh = session;
+  mapMeshChannel(internals, index, id);
+  return session;
+}
+
 function warnings(internals: Internals): string[] {
   return internals.status.snapshot().events.filter((event) => event.code === "REPLY_TARGET_UNAVAILABLE").map((event) => event.detail);
 }
 
-function meshSession(sendText: (...args: unknown[]) => Promise<number>) {
-  return {
-    device: { sendText },
-    channel: 3,
-    localNode: 7,
-    disconnected: new Promise<void>(() => undefined),
-  };
-}
-
-function discordMessage(id: string, content: string): unknown {
+function discordMessage(id: string, content: string, channelId = CHANNEL_A): unknown {
   return {
     id,
     type: 0,
-    channelId: config.discordChannelId,
+    channelId,
     author: { bot: false, globalName: null, username: "Ada" },
     member: { displayName: "Ada" },
     webhookId: null,
@@ -119,6 +165,7 @@ function reaction(
   displayName = "Server Nick",
   content = "target body",
   bridgeAuthored = false,
+  channelId = CHANNEL_A,
 ): unknown {
   return {
     partial: false,
@@ -126,7 +173,7 @@ function reaction(
     message: {
       partial: false,
       id: targetDiscordId,
-      channelId: config.discordChannelId,
+      channelId,
       guild: { members: { fetch: async () => ({ displayName }) } },
       author: { bot: bridgeAuthored, username: bridgeAuthored ? "Mesh Bridge" : "target-user" },
       content,
@@ -136,6 +183,21 @@ function reaction(
         users: { map: () => [] },
         roles: { map: () => [] },
       },
+    },
+  };
+}
+
+// A decoded broadcast text packet on a given mesh channel, for driving handleMeshPacket routing directly.
+function meshTextPacket(opts: { id: number; from: number; channel: number; text: string; replyId?: number }): unknown {
+  return {
+    id: opts.id,
+    from: opts.from,
+    to: 0,
+    channel: opts.channel,
+    rxTime: 1,
+    payloadVariant: {
+      case: "decoded",
+      value: { portnum: 1, payload: new TextEncoder().encode(opts.text), replyId: opts.replyId ?? 0, emoji: 0 },
     },
   };
 }
@@ -150,45 +212,32 @@ const reactor = {
 
 test("service telemetry writes full traffic bodies to disk without leaking configured tokens or TUI details", async (t) => {
   const internals = newService(t);
+  const pair = pairOf(internals);
   const sends: unknown[][] = [];
   const reactions: string[] = [];
-  internals.mesh = meshSession(async (...args) => {
+  attachMesh(internals, async (...args) => {
     sends.push(args);
     return 900 + sends.length;
   });
-  internals.discordChannel = {
+  pair.discordChannel = {
     send: async (options) => ({ id: `discord-${String(options.content).length}`, reference: null }),
     messages: { fetch: async () => ({ react: async (emoji) => { reactions.push(emoji); } }) },
   };
 
   await internals.handleDiscordMessage(discordMessage("discord-body", `discord visible ${config.discordToken}`));
-  await internals.deliverDiscordToMesh({ id: "chunk-body", chunks: [`chunk visible ${config.discordToken}`], replyToDiscordId: undefined });
-  internals.handleMeshPacket({
-    id: 700,
-    from: 42,
-    to: 0,
-    channel: 3,
-    rxTime: 1,
-    payloadVariant: {
-      case: "decoded",
-      value: {
-        portnum: 1,
-        payload: new TextEncoder().encode(`mesh visible ${config.ipcToken}`),
-        replyId: 0,
-        emoji: 0,
-      },
-    },
-  }, { channel: 3, localNode: 7 });
-  await internals.deliverMeshToDiscord({ from: 42, text: `discord post ${config.ipcToken}`, packetId: 701, replyId: 0 });
-  internals.replies.recordOutboundChunk("reaction-target", 0, 901);
+  await internals.deliverDiscordToMesh({ discordChannelId: CHANNEL_A, id: "chunk-body", chunks: [`chunk visible ${config.discordToken}`], replyToDiscordId: undefined });
+  internals.handleMeshPacket(meshTextPacket({ id: 700, from: 42, channel: 3, text: `mesh visible ${config.ipcToken}` }), { channel: 3, localNode: 7 });
+  await internals.deliverMeshToDiscord({ discordChannelId: CHANNEL_A, from: 42, text: `discord post ${config.ipcToken}`, packetId: 701, replyId: 0 });
+  pair.replies.recordOutboundChunk("reaction-target", 0, 901);
   await internals.deliverDiscordReactionToMesh({
+    discordChannelId: CHANNEL_A,
     targetDiscordId: "reaction-target",
     displayName: "Reactor",
     emoji: "heart",
     targetBody: `target visible ${config.discordToken}`,
   });
-  internals.replies.recordInbound(555, "tap-target");
-  await internals.deliverMeshTapbackToDiscord({ from: 42, emoji: "heart", packetId: 702, replyId: 555 });
+  pair.replies.recordInbound(555, "tap-target");
+  await internals.deliverMeshTapbackToDiscord({ discordChannelId: CHANNEL_A, from: 42, emoji: "heart", packetId: 702, replyId: 555 });
 
   assert.deepEqual(reactions, ["heart"]);
   const text = readFileSync(join(internals.stateDir, "Logs", "telemetry.jsonl"), "utf8");
@@ -204,31 +253,40 @@ test("service telemetry writes full traffic bodies to disk without leaking confi
   assert.equal(snapshot.includes(config.ipcToken), false);
 });
 
+test("service telemetry stamps service.version from package.json rather than a hardcoded value", async (t) => {
+  const internals = newService(t);
+  const pair = pairOf(internals);
+  attachMesh(internals, async () => 900);
+  pair.discordChannel = { send: async () => ({ id: "x", reference: null }) };
+  await internals.deliverDiscordToMesh({ discordChannelId: CHANNEL_A, id: "m1", chunks: ["[Ada]: hi"], replyToDiscordId: undefined });
+
+  const record = readFileSync(join(internals.stateDir, "Logs", "telemetry.jsonl"), "utf8")
+    .split(/\r?\n/u)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as { resource: { attributes: Array<{ key: string; value: { stringValue: string } }> } })[0]!;
+  const version = record.resource.attributes.find((attribute) => attribute.key === "service.version")?.value.stringValue;
+  assert.equal(version, packageVersion); // exactly what package.json holds, not "unknown" or a stale literal
+});
+
 test("Discord to Mesh sends the mesh root only on a reply's first chunk and maps chunks only once ACKed", async (t) => {
   const internals = newService(t);
+  const pair = pairOf(internals);
   const sends: unknown[][] = [];
   const atCall: Array<{ root: number | undefined; own: string | undefined }> = [];
   let owner = "root-msg";
-  internals.mesh = {
-    device: {
-      sendText: async (...args: unknown[]): Promise<number> => {
-        const packetId = 900 + sends.length;
-        sends.push(args);
-        atCall.push({ root: internals.replies.meshRootFor(owner), own: internals.replies.discordTargetFor(packetId) });
-        return packetId;
-      },
-    },
-    channel: 3,
-    localNode: 7,
-    disconnected: new Promise<void>(() => undefined),
-  };
+  attachMesh(internals, async (...args: unknown[]): Promise<number> => {
+    const packetId = 900 + sends.length;
+    sends.push(args);
+    atCall.push({ root: pair.replies.meshRootFor(owner), own: pair.replies.discordTargetFor(packetId) });
+    return packetId;
+  });
 
   const chunks = splitDiscordForMesh("Ada", "word ".repeat(120).trim());
   assert.ok(chunks.length > 1);
-  await internals.deliverDiscordToMesh({ id: owner, chunks, replyToDiscordId: undefined });
+  await internals.deliverDiscordToMesh({ discordChannelId: CHANNEL_A, id: owner, chunks, replyToDiscordId: undefined });
   const rootSends = sends.length;
   owner = "reply-msg";
-  await internals.deliverDiscordToMesh({ id: owner, chunks, replyToDiscordId: "root-msg" });
+  await internals.deliverDiscordToMesh({ discordChannelId: CHANNEL_A, id: owner, chunks, replyToDiscordId: "root-msg" });
 
   // Fifth argument (replyId) is explicitly passed on every send.
   for (const args of sends) assert.equal(args.length, 5);
@@ -241,41 +299,42 @@ test("Discord to Mesh sends the mesh root only on a reply's first chunk and maps
   assert.deepEqual(atCall[1], { root: 900, own: undefined });
   assert.deepEqual(atCall[rootSends], { root: undefined, own: undefined });
 
-  assert.equal(internals.replies.meshRootFor("root-msg"), 900);
-  assert.equal(internals.replies.meshRootFor("reply-msg"), 900 + rootSends);
+  assert.equal(pair.replies.meshRootFor("root-msg"), 900);
+  assert.equal(pair.replies.meshRootFor("reply-msg"), 900 + rootSends);
   for (let index = 0; index < sends.length; index += 1) {
-    assert.equal(internals.replies.discordTargetFor(900 + index), index < rootSends ? "root-msg" : "reply-msg");
+    assert.equal(pair.replies.discordTargetFor(900 + index), index < rootSends ? "root-msg" : "reply-msg");
   }
 });
 
 test("Mesh to Discord replies natively and warns once per unavailable target without re-sending", async (t) => {
   const internals = newService(t);
+  const pair = pairOf(internals);
   const sent: Array<Record<string, unknown>> = [];
   let reference: { messageId: string } | null = { messageId: "discord-root" };
-  internals.discordChannel = {
+  pair.discordChannel = {
     send: async (options: Record<string, unknown>) => {
       sent.push(options);
       return { id: `sent-${sent.length}`, reference };
     },
   };
-  internals.replies.recordOutboundChunk("discord-root", 0, 555);
+  pair.replies.recordOutboundChunk("discord-root", 0, 555);
 
-  await internals.deliverMeshToDiscord({ from: 42, text: "mesh secret body", packetId: 700, replyId: 555 });
+  await internals.deliverMeshToDiscord({ discordChannelId: CHANNEL_A, from: 42, text: "mesh secret body", packetId: 700, replyId: 555 });
   assert.deepEqual(sent[0]!.reply, { messageReference: "discord-root", failIfNotExists: false });
   assert.deepEqual(sent[0]!.allowedMentions, { parse: [], repliedUser: false });
-  assert.equal(internals.replies.discordTargetFor(700), "sent-1");
+  assert.equal(pair.replies.discordTargetFor(700), "sent-1");
   assert.deepEqual(warnings(internals), []);
 
   // Unmapped nonzero reply: exactly one unthreaded send and one sanitized warning.
   reference = null;
-  await internals.deliverMeshToDiscord({ from: 42, text: "mesh secret body", packetId: 701, replyId: 999 });
+  await internals.deliverMeshToDiscord({ discordChannelId: CHANNEL_A, from: 42, text: "mesh secret body", packetId: 701, replyId: 999 });
   assert.equal(sent.length, 2);
   assert.equal("reply" in sent[1]!, false);
   assert.equal(warnings(internals).length, 1);
   assert.deepEqual(JSON.parse(warnings(internals)[0]!), { direction: "meshToDiscord", referencedId: 999 });
 
   // Discord dropped the reference (failIfNotExists): warn once, never re-send.
-  await internals.deliverMeshToDiscord({ from: 42, text: "mesh secret body", packetId: 702, replyId: 555 });
+  await internals.deliverMeshToDiscord({ discordChannelId: CHANNEL_A, from: 42, text: "mesh secret body", packetId: 702, replyId: 555 });
   assert.equal(sent.length, 3);
   assert.deepEqual(sent[2]!.reply, { messageReference: "discord-root", failIfNotExists: false });
   assert.equal(warnings(internals).length, 2);
@@ -285,10 +344,11 @@ test("Mesh to Discord replies natively and warns once per unavailable target wit
 
 test("mesh heart tapback reacts natively, never sends text, and aliases its packet to the Discord target", async (t) => {
   const internals = newService(t);
+  const pair = pairOf(internals);
   const reactions: string[] = [];
   const textSends: unknown[] = [];
-  internals.replies.recordOutboundChunk("discord-target", 0, 555);
-  internals.discordChannel = {
+  pair.replies.recordOutboundChunk("discord-target", 0, 555);
+  pair.discordChannel = {
     send: async (options) => {
       textSends.push(options);
       return { id: "unexpected", reference: null };
@@ -300,6 +360,7 @@ test("mesh heart tapback reacts natively, never sends text, and aliases its pack
       },
     },
   };
+  mapMeshChannel(internals, 3);
   internals.meshToDiscord.start((job) => internals.deliverInbound(job));
 
   internals.handleMeshPacket({
@@ -322,26 +383,28 @@ test("mesh heart tapback reacts natively, never sends text, and aliases its pack
 
   assert.deepEqual(reactions, ["❤️"]);
   assert.deepEqual(textSends, []);
-  assert.equal(internals.replies.discordTargetFor(700), "discord-target");
-  assert.equal(internals.replies.meshRootFor("discord-target"), 555);
+  assert.equal(pair.replies.discordTargetFor(700), "discord-target");
+  assert.equal(pair.replies.meshRootFor("discord-target"), 555);
 });
 
 test("invalid mesh tapbacks are rejected without text delivery or payload logging", async (t) => {
   const internals = newService(t);
+  const pair = pairOf(internals);
   const delivered: string[] = [];
-  internals.replies.recordOutboundChunk("discord-target", 0, 555);
-  internals.discordChannel = {
+  pair.replies.recordOutboundChunk("discord-target", 0, 555);
+  pair.discordChannel = {
     send: async (options) => {
       delivered.push(String(options.content));
       return { id: "unexpected", reference: null };
     },
     messages: { fetch: async () => ({ react: async (emoji) => { delivered.push(emoji); } }) },
   };
+  mapMeshChannel(internals, 3);
   internals.meshToDiscord.start((job) => internals.deliverInbound(job));
 
   for (const [index, [payload, replyId]] of ([
     ["", 555],
-    ["\u0000", 555],
+    [" ", 555],
     ["secret-invalid", 555],
     ["❤️", 0],
   ] as const).entries()) {
@@ -373,21 +436,22 @@ test("invalid mesh tapbacks are rejected without text delivery or payload loggin
 
 test("mesh tapback target and REST failures are counted and never log payload content", async (t) => {
   const internals = newService(t);
-  await internals.deliverMeshTapbackToDiscord({ from: 42, emoji: "secret-heart", packetId: 701, replyId: 999 });
+  const pair = pairOf(internals);
+  await internals.deliverMeshTapbackToDiscord({ discordChannelId: CHANNEL_A, from: 42, emoji: "secret-heart", packetId: 701, replyId: 999 });
 
-  internals.replies.recordInbound(555, "deleted-target");
-  internals.discordChannel = {
+  pair.replies.recordInbound(555, "deleted-target");
+  pair.discordChannel = {
     send: async () => ({ id: "unexpected", reference: null }),
     messages: { fetch: async () => { throw new Error("secret-heart deleted body"); } },
   };
-  await internals.deliverMeshTapbackToDiscord({ from: 42, emoji: "secret-heart", packetId: 702, replyId: 555 });
+  await internals.deliverMeshTapbackToDiscord({ discordChannelId: CHANNEL_A, from: 42, emoji: "secret-heart", packetId: 702, replyId: 555 });
 
   const snapshot = internals.status.snapshot();
   assert.equal(snapshot.counters.failures, 2);
   assert.ok(snapshot.events.some((event) => event.code === "DISCORD_REACTION_TARGET_UNAVAILABLE"));
   assert.ok(snapshot.events.some((event) => event.code === "DISCORD_REACTION_DELIVERY_FAILED"));
   assert.ok(snapshot.events.every((event) => !event.detail.includes("secret-heart") && !event.detail.includes("deleted body")));
-  assert.equal(internals.replies.discordTargetFor(702), "deleted-target");
+  assert.equal(pair.replies.discordTargetFor(702), "deleted-target");
 });
 
 test("mapped Unicode and custom Discord reactions send exact five-argument reply text", async (t) => {
@@ -397,21 +461,22 @@ test("mapped Unicode and custom Discord reactions send exact five-argument reply
       root: 500,
       emoji: { id: null, name: "❤️" },
       expected: [["Server Nick reacted with ❤️", "broadcast", true, 3, 500]],
-      correlate: (internals: Internals) => internals.replies.recordOutboundChunk("discord-origin", 0, 500),
+      correlate: (replies: ReplyCorrelator) => replies.recordOutboundChunk("discord-origin", 0, 500),
     },
     {
       target: "bridge-bot-post",
       root: 600,
       emoji: { id: "custom-id", name: "lol" },
       expected: [["Server Nick reacted with :lol:", "broadcast", true, 3, 600]],
-      correlate: (internals: Internals) => internals.replies.recordInbound(600, "bridge-bot-post"),
+      correlate: (replies: ReplyCorrelator) => replies.recordInbound(600, "bridge-bot-post"),
     },
   ]) {
     await t.test(fixture.target, async (subtest) => {
       const internals = newService(subtest);
+      const pair = pairOf(internals);
       const sends: unknown[][] = [];
-      fixture.correlate(internals);
-      internals.mesh = meshSession(async (...args) => {
+      fixture.correlate(pair.replies);
+      attachMesh(internals, async (...args) => {
         sends.push(args);
         return fixture.root + sends.length;
       });
@@ -422,19 +487,20 @@ test("mapped Unicode and custom Discord reactions send exact five-argument reply
 
       assert.deepEqual(sends, fixture.expected);
       assert.equal(sends[0]!.length, 5);
-      assert.equal(internals.replies.meshRootFor(fixture.target), fixture.root);
-      assert.equal(internals.replies.discordTargetFor(fixture.root + 1), fixture.target);
+      assert.equal(pair.replies.meshRootFor(fixture.target), fixture.root);
+      assert.equal(pair.replies.discordTargetFor(fixture.root + 1), fixture.target);
     });
   }
 });
 
 test("Discord reaction resolves partial users before routing and ignores bot and wrong-channel events", async (t) => {
   const internals = newService(t);
+  const pair = pairOf(internals);
   const sends: unknown[][] = [];
   let partialFetches = 0;
   const fetchOrder: string[] = [];
-  internals.replies.recordOutboundChunk("partial-target", 0, 800);
-  internals.mesh = meshSession(async (...args) => {
+  pair.replies.recordOutboundChunk("partial-target", 0, 800);
+  attachMesh(internals, async (...args) => {
     sends.push(args);
     return 810 + sends.length;
   });
@@ -453,7 +519,7 @@ test("Discord reaction resolves partial users before routing and ignores bot and
   let botReactionFetches = 0;
   await internals.handleDiscordReaction({
     partial: true,
-    message: { channelId: config.discordChannelId },
+    message: { channelId: CHANNEL_A },
     fetch: async () => {
       botReactionFetches += 1;
       return reaction("ignored-partial-bot", { id: null, name: "😀" });
@@ -472,7 +538,7 @@ test("Discord reaction resolves partial users before routing and ignores bot and
   };
   await internals.handleDiscordReaction({
     partial: true,
-    message: { channelId: config.discordChannelId },
+    message: { channelId: CHANNEL_A },
     fetch: async () => {
       partialFetches += 1;
       fetchOrder.push("reaction");
@@ -503,7 +569,7 @@ test("Discord reaction resolves partial users before routing and ignores bot and
 test("uncorrelated Discord reaction sends one unthreaded excerpt packet", async (t) => {
   const internals = newService(t);
   const sends: unknown[][] = [];
-  internals.mesh = meshSession(async (...args) => {
+  attachMesh(internals, async (...args) => {
     sends.push(args);
     return 901;
   });
@@ -520,8 +586,9 @@ test("uncorrelated Discord reaction sends one unthreaded excerpt packet", async 
 test("empty uncorrelated target and ACK exhaustion fail clearly as 0/1", async (t) => {
   await t.test("empty target", async (subtest) => {
     const internals = newService(subtest);
+    const pair = pairOf(internals);
     const reports: string[] = [];
-    internals.discordChannel = {
+    pair.discordChannel = {
       send: async (options) => {
         reports.push(String(options.content));
         return { id: "report", reference: null };
@@ -536,20 +603,22 @@ test("empty uncorrelated target and ACK exhaustion fail clearly as 0/1", async (
 
   await t.test("ACK exhaustion", async (subtest) => {
     const internals = newService(subtest, { ackRetries: 2 });
+    const pair = pairOf(internals);
     const sends: unknown[][] = [];
     const reports: string[] = [];
-    internals.replies.recordOutboundChunk("target", 0, 900);
-    internals.mesh = meshSession(async (...args) => {
+    pair.replies.recordOutboundChunk("target", 0, 900);
+    attachMesh(internals, async (...args) => {
       sends.push(args);
       throw new Error("secret reaction content");
     });
-    internals.discordChannel = {
+    pair.discordChannel = {
       send: async (options) => {
         reports.push(String(options.content));
         return { id: "report", reference: null };
       },
     };
     await internals.deliverDiscordReactionToMesh({
+      discordChannelId: CHANNEL_A,
       targetDiscordId: "target",
       displayName: "Secret Reactor",
       emoji: "❤️",
@@ -571,4 +640,126 @@ test("empty uncorrelated target and ACK exhaustion fail clearly as 0/1", async (
     ]);
     assert.ok(snapshot.events.every((event) => !event.detail.includes("secret reaction content")));
   });
+});
+
+// ---------------------------------------------------------------------------
+// Multi-pair isolation: a message received on one pair must never reach another.
+// ---------------------------------------------------------------------------
+
+test("multi-pair: a Discord message is relayed only to its own pair's mesh channel", async (t) => {
+  const internals = newService(t, { channels: twoPairChannels });
+  const sends: Array<{ channel: number; text: unknown }> = [];
+  const sendText = async (...args: unknown[]): Promise<number> => {
+    sends.push({ channel: args[3] as number, text: args[0] });
+    return 900 + sends.length;
+  };
+  // One shared transmitter; each pair resolved to a distinct device index (A->3, B->4).
+  internals.mesh = { device: { sendText }, localNode: 7, disconnected: new Promise<void>(() => undefined) };
+  mapMeshChannel(internals, 3, CHANNEL_A);
+  mapMeshChannel(internals, 4, CHANNEL_B);
+  internals.discordToMesh.start((job) => internals.deliverOutbound(job));
+
+  await internals.handleDiscordMessage(discordMessage("msg-a", "hello from A", CHANNEL_A));
+  assert.equal(await internals.discordToMesh.drain(1_000), true);
+
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0]!.channel, 3);            // pair A's own mesh index
+  assert.ok(sends.every((send) => send.channel !== 4)); // never pair B's index
+});
+
+test("multi-pair: a mesh packet is delivered only to its own pair's Discord channel", async (t) => {
+  const internals = newService(t, { channels: twoPairChannels });
+  const pairA = pairOf(internals, CHANNEL_A);
+  const pairB = pairOf(internals, CHANNEL_B);
+  const sentA: string[] = [];
+  const sentB: string[] = [];
+  pairA.discordChannel = { send: async (options) => { sentA.push(String(options.content)); return { id: "a", reference: null }; } };
+  pairB.discordChannel = { send: async (options) => { sentB.push(String(options.content)); return { id: "b", reference: null }; } };
+  mapMeshChannel(internals, 3, CHANNEL_A);
+  mapMeshChannel(internals, 4, CHANNEL_B);
+  internals.meshToDiscord.start((job) => internals.deliverInbound(job));
+
+  internals.handleMeshPacket(meshTextPacket({ id: 700, from: 42, channel: 4, text: "packet for B" }), { channel: 4, localNode: 7 });
+  assert.equal(await internals.meshToDiscord.drain(1_000), true);
+
+  assert.equal(sentA.length, 0);
+  assert.equal(sentB.length, 1);
+  assert.ok(sentB[0]!.includes("packet for B"));
+});
+
+test("multi-pair: the same packet id on two mesh channels is not deduplicated across pairs", async (t) => {
+  const internals = newService(t, { channels: twoPairChannels });
+  const pairA = pairOf(internals, CHANNEL_A);
+  const pairB = pairOf(internals, CHANNEL_B);
+  const sentA: string[] = [];
+  const sentB: string[] = [];
+  pairA.discordChannel = { send: async (options) => { sentA.push(String(options.content)); return { id: "a", reference: null }; } };
+  pairB.discordChannel = { send: async (options) => { sentB.push(String(options.content)); return { id: "b", reference: null }; } };
+  mapMeshChannel(internals, 3, CHANNEL_A);
+  mapMeshChannel(internals, 4, CHANNEL_B);
+  internals.meshToDiscord.start((job) => internals.deliverInbound(job));
+
+  // Identical packet id + sender, different mesh channels: pair-namespaced dedup keys keep both.
+  internals.handleMeshPacket(meshTextPacket({ id: 700, from: 42, channel: 3, text: "same id on A" }), { channel: 3, localNode: 7 });
+  internals.handleMeshPacket(meshTextPacket({ id: 700, from: 42, channel: 4, text: "same id on B" }), { channel: 4, localNode: 7 });
+  assert.equal(await internals.meshToDiscord.drain(1_000), true);
+
+  assert.equal(sentA.length, 1);
+  assert.equal(sentB.length, 1);
+
+  // A genuine duplicate on the SAME channel is still deduped, proving the guard is namespaced, not disabled.
+  internals.handleMeshPacket(meshTextPacket({ id: 700, from: 42, channel: 3, text: "dup on A" }), { channel: 3, localNode: 7 });
+  assert.equal(await internals.meshToDiscord.drain(1_000), true);
+  assert.equal(sentA.length, 1);
+});
+
+test("multi-pair: each pair persists reply mappings to its own journal file", (t) => {
+  const internals = newService(t, { channels: twoPairChannels });
+  const pairA = pairOf(internals, CHANNEL_A);
+  const pairB = pairOf(internals, CHANNEL_B);
+  assert.notEqual(pairA.journal.file, pairB.journal.file);
+  assert.ok(pairA.journal.file.includes(CHANNEL_A));
+  assert.ok(pairB.journal.file.includes(CHANNEL_B));
+
+  pairA.replies.recordInbound(401, "discord-a-msg");
+  pairB.replies.recordInbound(402, "discord-b-msg");
+
+  const textA = readFileSync(pairA.journal.file, "utf8");
+  const textB = readFileSync(pairB.journal.file, "utf8");
+  assert.ok(textA.includes("discord-a-msg") && !textA.includes("discord-b-msg"));
+  assert.ok(textB.includes("discord-b-msg") && !textB.includes("discord-a-msg"));
+});
+
+test("multi-pair: reply correlation is isolated to the originating pair", (t) => {
+  const internals = newService(t, { channels: twoPairChannels });
+  const pairA = pairOf(internals, CHANNEL_A);
+  const pairB = pairOf(internals, CHANNEL_B);
+  pairA.replies.recordInbound(555, "discord-a-root");
+
+  assert.equal(pairA.replies.discordTargetFor(555), "discord-a-root");
+  assert.equal(pairA.replies.meshRootFor("discord-a-root"), 555);
+  // Pair B shares neither direction of the correlation.
+  assert.equal(pairB.replies.discordTargetFor(555), undefined);
+  assert.equal(pairB.replies.meshRootFor("discord-a-root"), undefined);
+});
+
+test("multi-pair: an unresolved pair stays pending and receives no Mesh->Discord traffic", async (t) => {
+  const internals = newService(t, { channels: twoPairChannels });
+  const pairB = pairOf(internals, CHANNEL_B);
+  const sentB: string[] = [];
+  pairB.discordChannel = { send: async (options) => { sentB.push(String(options.content)); return { id: "b", reference: null }; } };
+  // Only pair A resolves against the device; pair B's mesh name never resolves, so it stays pending.
+  mapMeshChannel(internals, 3, CHANNEL_A);
+  internals.status.connection({ channelPairs: internals.channelPairsStatus() });
+  internals.meshToDiscord.start((job) => internals.deliverInbound(job));
+
+  // No pairsByMeshChannel entry maps to pair B, so a packet on its would-be index (or any other) is ignored.
+  internals.handleMeshPacket(meshTextPacket({ id: 700, from: 42, channel: 4, text: "for pending B" }), { channel: 4, localNode: 7 });
+  internals.handleMeshPacket(meshTextPacket({ id: 701, from: 42, channel: 9, text: "for nobody" }), { channel: 9, localNode: 7 });
+  assert.equal(await internals.meshToDiscord.drain(1_000), true);
+  assert.equal(sentB.length, 0);
+
+  const pairs = internals.status.snapshot().connections.channelPairs;
+  assert.equal(pairs.find((entry) => entry.discordChannelId === CHANNEL_A)?.meshChannelIndex, 3);
+  assert.equal(pairs.find((entry) => entry.discordChannelId === CHANNEL_B)?.meshChannelIndex, null);
 });
