@@ -120,6 +120,13 @@ Target SHA: <sha checked out for validation>
   routine. It does not prove that the routine completed successfully. The
   `claude-routine-verdict` status proves the routine's latest report for the
   current head SHA carries `Status: pass`.
+- The verdict bridge trusts owner-authored report comments, and the routine
+  itself posts as the owner account. The verdict status is therefore a
+  mechanical floor, not an independent approval: it blocks merges that lack a
+  passing report, but it cannot prove the report is trustworthy. A routine
+  manipulated through untrusted PR content could still post `Status: pass`, so
+  the human-review requirement below stays normative and the merge decision
+  stays with the owner.
 - No PR may merge unless the latest Claude Routine report for the current head
   SHA has `Status: pass`, or the owner explicitly approves an emergency override
   that names the risk and accepted bypass.
