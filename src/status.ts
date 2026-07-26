@@ -20,7 +20,7 @@ export interface StatusSnapshot {
     meshtastic: LinkState;
     serialPort: string;
     localNode: string;
-    meshChannel: string;
+    channelPairs: Array<{ discordChannelId: string; meshtasticChannelName: string; meshChannelIndex: number | null }>;
   };
   counters: Record<string, number>;
   queues: { discordToMesh: number; meshToDiscord: number };
@@ -44,7 +44,7 @@ export class StatusStore extends EventEmitter {
   private telemetry?: TelemetrySink;
   private readonly state: StatusSnapshot = {
     startedAt: new Date().toISOString(),
-    connections: { discord: "offline", meshtastic: "offline", serialPort: "-", localNode: "-", meshChannel: "-" },
+    connections: { discord: "offline", meshtastic: "offline", serialPort: "-", localNode: "-", channelPairs: [] },
     counters: { discordReceived: 0, meshSent: 0, meshReceived: 0, discordSent: 0, retries: 0, failures: 0, rejected: 0 },
     queues: { discordToMesh: 0, meshToDiscord: 0 },
     logDegraded: false,

@@ -6,6 +6,7 @@ services:
     environment:
       MESH_BRIDGE_STATE_DIR: /var/lib/mesh-bridge
     volumes:
+      - ./config.jsonc:/app/config.jsonc:ro
       - mesh-state:/var/lib/mesh-bridge
     devices:
       - "/dev/ttyUSB0:/dev/ttyUSB0"

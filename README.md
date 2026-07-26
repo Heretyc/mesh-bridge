@@ -7,7 +7,7 @@ Headless Discord ↔ Meshtastic USB serial bridge for Windows, Linux, macOS, and
 - Windows 10/11 x64 with PowerShell 5.1+, Linux with systemd user services, macOS with launchd LaunchAgents, or Docker on Linux
 - Node.js 22 or newer
 - Exactly one Meshtastic USB serial device connected; unrelated USB serial devices may remain connected
-- One enabled, encrypted Meshtastic channel with a unique name of at most 11 UTF-8 bytes
+- Between one and eight enabled, encrypted Meshtastic channels, each with a unique name of at most 11 UTF-8 bytes
 - Administrator access only for Windows service installation and control; Linux/macOS install as user services
 
 The bridge uses the latest published official Node serial pairing: `@meshtastic/transport-node-serial@0.0.2` with `@meshtastic/core@2.6.7`. These are also the versions in Meshtastic Web release `v2.7.1`. The active Meshtastic main branch contains an unreleased replacement SDK; this project does not depend on unreleased source.
@@ -21,13 +21,13 @@ The bridge uses the latest published official Node serial pairing: `@meshtastic/
    - Send Messages
    - Read Message History
    - Add Reactions
-4. Apply those permissions only to the bridge channel, then copy that channel ID into `.env`.
+4. Apply those permissions to each bridge channel; record each channel ID for entry in `config.jsonc`.
 
 The bot validates its username, channel visibility, and these four permissions at startup. Read Message History is required so native replies and mesh tapbacks can find earlier messages; Add Reactions is required for native mesh tapbacks. It does not need Manage Messages, Mention Everyone, attachments, embeds, commands, or administrator access. Discord posts use `allowedMentions.parse = []`.
 
 ## Meshtastic setup
 
-Configure the desired channel on the radio first. Put its exact, case-sensitive name in `MESHTASTIC_CHANNEL_NAME`; the PSK remains on the radio and is never stored by this service. Startup fails closed if the name is missing, duplicated, disabled, unencrypted, or outside channel indexes 0–7. The local node number and node long names are learned during device configuration.
+Configure each desired channel on the radio first. Put its exact, case-sensitive name in `config.jsonc` under the appropriate channel pair; the PSK remains on the radio and is never stored by this service. Startup fails closed if any configured name is missing, duplicated, disabled, unencrypted, or outside channel indexes 0–7. The local node number and node long names are learned during device configuration.
 
 USB discovery is platform-aware: Windows probes USB-backed COM ports, Linux probes `/dev/ttyUSB*` and `/dev/ttyACM*`, and macOS opens only `/dev/cu.*` devices. Candidates are probed sequentially with the official Meshtastic configuration handshake, and forwarding activates only after exactly one radio responds. Locked and non-Meshtastic ports are rejected; zero or multiple responsive radios fail closed and retry with exponential backoff.
 
@@ -38,12 +38,18 @@ npm ci
 Copy-Item .env.example .env
 [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
 notepad .env
+Copy-Item config.jsonc.example config.jsonc
+notepad config.jsonc
 npm run typecheck
 npm run build
 npm test
 ```
 
-Set the generated value as `IPC_TOKEN`, then set `DISCORD_TOKEN`, `DISCORD_CHANNEL_ID`, and `MESHTASTIC_CHANNEL_NAME`. Optional values in `.env.example` bound queues, retries, pacing, configuration timeout, deduplication lifetime, and the loopback IPC port.
+In `.env`, set `IPC_TOKEN` to the generated value and set `DISCORD_TOKEN` to the bot token. In `config.jsonc`, populate the `channels` array with one entry per Discord–Meshtastic pair: each entry takes a `discordChannelId` (Discord snowflake) and a `meshtasticChannelName` (exact channel name as configured on the radio). Between 1 and 8 pairs are supported. Tuning values (`ipcPort`, `queueLimit`, `ackRetries`, `sendIntervalMs`, `configTimeoutMs`, `dedupTtlMs`) are optional; defaults and accepted ranges are documented in `config.jsonc.example`.
+
+The bridge resolves `config.jsonc` from the process working directory. The service installer sets the working directory to the project root on all supported platforms (systemd, launchd, and WinSW), so the installed service finds `config.jsonc` automatically. Docker requires an explicit bind mount; see the Docker section.
+
+If `DISCORD_CHANNEL_ID` or `MESHTASTIC_CHANNEL_NAME` remain in `.env` from an earlier install, the bridge fails at startup and names the offending variables. Remove them from `.env` and move the channel pair to `config.jsonc`.
 
 The service warns if `.env` inherits readable permissions for broad Windows groups. To restrict it to the current user, SYSTEM, and the service account, run this from elevated PowerShell in the project directory:
 
@@ -81,11 +87,11 @@ From a normal terminal in the project directory:
 npm run tui
 ```
 
-The TUI shows link states, serial port, local node ID, resolved channel index, queue depths, counters, and the last 25 sanitized events. It binds only to the service's raw TCP listener on `127.0.0.1`, authenticates with `IPC_TOKEN`, and has no command protocol. Any post-auth client input closes the connection. This is local IPC, not an HTTP/web server.
+The TUI shows link states, serial port, local node ID, the configured pairs each with its resolved channel index or pending, queue depths, counters, and the last 25 sanitized events. It binds only to the service's raw TCP listener on `127.0.0.1`, authenticates with `IPC_TOKEN`, and has no command protocol. Any post-auth client input closes the connection. This is local IPC, not an HTTP/web server.
 
 ## Routing behavior
 
-Discord → Mesh accepts only ordinary user messages (including replies, but not referenced reply content) in `DISCORD_CHANNEL_ID`. Bots, webhooks, system messages, duplicate Discord IDs, embeds, stickers, and empty messages are ignored. Exactly three forms are rewritten in the message text: `<@id>` and `<@!id>` become `@` plus that guild member's display name, falling back to the mentioned user's display name, and `<@&id>` becomes `@` plus the role name. Every other byte is passed through, including plain text, URLs, mentions whose id the message does not resolve, `@everyone`/`@here`, channel mentions, slash-command mentions, custom emoji, and timestamps. Substitution is positional, so a mention written inside a URL is rewritten there too. Attachment URLs and bodies are ignored, while each safe filename and extension is appended.
+Discord → Mesh accepts only ordinary user messages (including replies, but not referenced reply content) in the configured Discord channels. Messages in unconfigured channels are ignored. Bots, webhooks, system messages, duplicate Discord IDs, embeds, stickers, and empty messages are ignored. Exactly three forms are rewritten in the message text: `<@id>` and `<@!id>` become `@` plus that guild member's display name, falling back to the mentioned user's display name, and `<@&id>` becomes `@` plus the role name. Every other byte is passed through, including plain text, URLs, mentions whose id the message does not resolve, `@everyone`/`@here`, channel mentions, slash-command mentions, custom emoji, and timestamps. Substitution is positional, so a mention written inside a URL is rewritten there too. Attachment URLs and bodies are ignored, while each safe filename and extension is appended.
 
 Native replies are translated in both directions. A Discord reply is relayed with the Meshtastic `reply_id` of the referenced message's first mesh chunk, set only on chunk 1; continuation chunks carry no reply id. A mesh reply is posted as a real Discord reply with `failIfNotExists: false` and the same disabled mentions. The first mesh chunk of a Discord message is the canonical reply root, while every chunk maps back to that Discord message, so a mesh reply to any chunk threads onto the original. When the referenced message is unknown, expired, or deleted, the message is relayed unthreaded and `REPLY_TARGET_UNAVAILABLE` is emitted with only the direction and referenced id.
 
@@ -93,7 +99,7 @@ Reaction additions are translated in both directions. A non-bot Discord reaction
 
 A message that fits one mesh packet is formatted as `[Display name]: text`. Split messages use `[Display name]: (i/n) text` on every chunk. Chunks are split on whitespace where possible and otherwise at Unicode grapheme boundaries. Resolved mention text, brackets, attribution, and numbering all count against the 232-byte UTF-8 text ceiling: current firmware permits a 239-byte encoded `Data` envelope after the 16-byte radio header, and the text port plus required bitfield consume seven encoded bytes. Sends are paced, request ACKs, and use bounded retries. Queue rejection and partial/final delivery failures are reported to Discord and the TUI without repeating message content.
 
-Mesh → Discord accepts only decoded `TEXT_MESSAGE_APP` packets on the resolved channel. Broadcasts and direct messages are both forwarded; local-node echoes and bounded-TTL duplicates are suppressed. Output is `**[Mesh long name]:** text`, with Discord Markdown escaped inside the name and `Unknown !nodeid` used only when the radio has not supplied a long name. Mentions are disabled.
+Mesh → Discord accepts only decoded `TEXT_MESSAGE_APP` packets on configured Meshtastic channels; each packet routes to its paired Discord channel. Broadcasts and direct messages are both forwarded; local-node echoes and bounded-TTL duplicates are suppressed. Output is `**[Mesh long name]:** text`, with Discord Markdown escaped inside the name and `Unknown !nodeid` used only when the radio has not supplied a long name. Mentions are disabled.
 
 ## Reliability and logs
 
@@ -104,13 +110,13 @@ Mesh → Discord accepts only decoded `TEXT_MESSAGE_APP` packets on the resolved
 - Local telemetry is one OTel-shaped JSONL file named `telemetry.jsonl`: `%ProgramData%\Mesh Bridge\Logs` on Windows, `${XDG_STATE_HOME:-$HOME/.local/state}/mesh-bridge/logs` on Linux, and `$HOME/Library/Logs/Mesh Bridge` on macOS. `MESH_BRIDGE_STATE_DIR` overrides the root for tests and portable installs.
 - The telemetry file is local-only: there is no exporter, collector, HTTP endpoint, or new dependency. Full Discord and Mesh message bodies are written to disk, with exact `DISCORD_TOKEN` and `IPC_TOKEN` value redaction before write. The TUI and IPC snapshot stay sanitized and do not show message bodies.
 - There is exactly one active telemetry file. Startup and the daily local 02:00 prune atomically rewrite it to keep records from the last 24 hours, skip malformed lines, and allow near-48-hour physical retention. A telemetry filesystem failure never stops relay traffic; the TUI and stderr report the degraded state once and report recovery once.
-- Reply correlation is persisted in one local JSONL journal per validated Discord channel id under the state journal directory. It is capped at 10,000 live entries per direction with a rolling 30-day lifetime, replays at startup, tolerates malformed lines, and compacts atomically at startup and daily local 02:00. A journal filesystem failure never stops relay traffic; in-memory reply correlation continues and the TUI/stderr report the degraded state once.
+- Reply correlation is persisted in one local JSONL journal per configured Discord channel ID under the state journal directory. It is capped at 10,000 live entries per direction with a rolling 30-day lifetime, replays at startup, tolerates malformed lines, and compacts atomically at startup and daily local 02:00. A journal filesystem failure never stops relay traffic; in-memory reply correlation continues and the TUI/stderr report the degraded state once.
 
 WinSW wrapper output remains under the Windows service wrapper log path.
 
 ## Docker
 
-The Docker image targets Node 22 LTS on `node:22-bookworm-slim`. Production Compose uses `restart: unless-stopped`, reads `.env`, mounts a named state volume at `/var/lib/mesh-bridge`, maps `/dev/ttyUSB0`, adds the `dialout` group, and publishes no ports.
+The Docker image targets Node 22 LTS on `node:22-bookworm-slim`. Production Compose uses `restart: unless-stopped`, reads `.env`, bind-mounts `./config.jsonc` read-only at `/app/config.jsonc`, mounts a named state volume at `/var/lib/mesh-bridge`, maps `/dev/ttyUSB0`, adds the `dialout` group, and publishes no ports.
 
 ```bash
 docker build -t mesh-bridge .
@@ -128,18 +134,18 @@ The primary target is `linux/amd64`; build arm64 on arm64 hardware so native ser
 
 ## Recovery
 
-- **Missing configuration:** run `node dist\service.js` interactively; the fatal error names the missing/invalid variable.
+- **Missing configuration:** run `node dist\service.js` interactively; the startup error names the missing secret, invalid setting, or absent `config.jsonc`.
 - **Zero or multiple Meshtastic radios:** connect exactly one configured radio and watch `npm run tui`; unrelated or locked USB serial ports are reported as rejected and retry is automatic.
-- **Channel failure:** correct the exact encrypted channel name on the radio and in `.env`, then restart the service.
-- **Discord failure:** confirm the bot is named `Mesh Bridge`, Message Content Intent is enabled, the channel ID is correct, and only View Channel + Send Messages + Read Message History + Add Reactions are granted.
+- **Channel failure:** correct the exact encrypted channel name on the radio and in `config.jsonc`, then restart the service.
+- **Discord failure:** confirm the bot is named `Mesh Bridge`, Message Content Intent is enabled, the channel IDs in `config.jsonc` are correct, and only View Channel + Send Messages + Read Message History + Add Reactions are granted.
 - **Replies arrive unthreaded:** expected when the referenced message predates the 30-day reply journal window, was evicted from the 10,000-entry direction cap, or when the Discord target was deleted. The bridge relays the text unthreaded and records `REPLY_TARGET_UNAVAILABLE` with only the direction and referenced id; no action is needed.
 - **Reaction reports 0/1:** the single ACK-requested reaction text exhausted its retry budget or could not fit safely. Check the sanitized TUI event and link state; an unavailable target mapping falls back to an unthreaded excerpt.
 - **Service will not start:** inspect the WinSW wrapper log and local `telemetry.jsonl`, then run `node dist\service.js` interactively after stopping the service.
-- **TUI cannot attach:** verify `IPC_TOKEN` and `IPC_PORT` match the service `.env`; only one service instance can own the port.
+- **TUI cannot attach:** verify `IPC_TOKEN` in `.env` and `ipcPort` in `config.jsonc` match the running service; only one service instance can own the port.
 
 ## Known limitations
 
-- Discovery probes accessible USB serial ports sequentially, so an unrelated responsive port can delay startup by up to `CONFIG_TIMEOUT_MS`. It never picks the first port and still fails closed if zero or multiple Meshtastic radios answer.
+- Discovery probes accessible USB serial ports sequentially, so an unrelated responsive port can delay startup by up to `configTimeoutMs` (default 30 seconds). It never picks the first port and still fails closed if zero or multiple Meshtastic radios answer.
 - The official Meshtastic packages publish incomplete declaration aliases. Application code remains strict TypeScript, while `skipLibCheck` is enabled only for dependency declaration files.
 - The official core ACK timeout is 60 seconds. With the default two retries, a final radio failure can take about three minutes.
 - Deduplication, node names, queues, and pending work are memory-only and reset on service restart.

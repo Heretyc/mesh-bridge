@@ -1,0 +1,54 @@
+{
+  // IPC status listener port — loopback-only, read-only.
+  // Integer, 1024..65535. Default: 47652.
+  "ipcPort": 47652,
+
+  // ── Global tuning ─────────────────────────────────────────────────────────
+  // These values apply equally to every channel pair. All are optional;
+  // omit any entry to accept the default shown.
+
+  // Total in-memory jobs per direction (Discord→Mesh or Mesh→Discord).
+  // Not multiplied by the number of pairs.
+  // Integer, 1..1000. Default: 100.
+  "queueLimit": 100,
+
+  // Mesh send ACK retry count.
+  // Integer, 0..5. Default: 2.
+  "ackRetries": 2,
+
+  // Minimum time between radio transmissions (one send clock shared by all pairs).
+  // Integer, 250..60000 ms. Default: 1000.
+  "sendIntervalMs": 1000,
+
+  // Meshtastic device configuration handshake timeout.
+  // Integer, 5000..120000 ms. Default: 30000.
+  "configTimeoutMs": 30000,
+
+  // Deduplication cache entry lifetime.
+  // Integer, 10000..3600000 ms. Default: 300000.
+  "dedupTtlMs": 300000,
+
+  // ── Channel pairs ─────────────────────────────────────────────────────────
+  // Required. Between 1 and 8 strict one-to-one pairs.
+  //
+  // Validation rules:
+  //   • discordChannelId  — Discord snowflake matching ^\d{17,20}$
+  //   • meshtasticChannelName — non-empty string of at most 11 UTF-8 bytes
+  //     (matches the on-device channel-name field limit)
+  //   • Both fields must be globally unique across all pairs.
+  //     No fan-in and no fan-out: each Discord channel pairs with exactly one
+  //     Meshtastic channel and vice versa.
+  //
+  // Copy this file to config.jsonc and replace the placeholder values with
+  // real channel IDs and names before starting the bridge.
+  "channels": [
+    {
+      "discordChannelId": "111111111111111111",
+      "meshtasticChannelName": "primary"
+    },
+    {
+      "discordChannelId": "222222222222222222",
+      "meshtasticChannelName": "secondary"
+    }
+  ]
+}

@@ -17,12 +17,21 @@ function render(status: StatusSnapshot): void {
   const events = status.events.slice(-12).map((event) =>
     `${event.at.slice(11, 19)} ${event.level.toUpperCase().padEnd(5)} ${visible(event.code)} ${visible(event.detail)}`,
   );
+  const pairs = connections.channelPairs.length
+    ? connections.channelPairs.map((pair) =>
+        `Discord ${visible(pair.discordChannelId)} <-> Meshtastic ${visible(pair.meshtasticChannelName)} (index ${pair.meshChannelIndex === null ? "pending" : pair.meshChannelIndex})`,
+      )
+    : ["(none)"];
   const output = [
     "Mesh Bridge — read-only local status",
     `Started ${status.startedAt}`,
     "",
     `Discord: ${connections.discord}  Meshtastic: ${connections.meshtastic}`,
-    `Serial: ${visible(connections.serialPort)}  Node: ${visible(connections.localNode)}  Channel index: ${visible(connections.meshChannel)}`,
+    `Serial: ${visible(connections.serialPort)}  Node: ${visible(connections.localNode)}`,
+    "",
+    "Configured pairs",
+    ...pairs,
+    "",
     `Queues: Discord→Mesh ${status.queues.discordToMesh}  Mesh→Discord ${status.queues.meshToDiscord}`,
     `Counters: ${counters}`,
     ...(status.logDegraded ? ["", "Telemetry log writes are degraded; relay traffic is still running."] : []),

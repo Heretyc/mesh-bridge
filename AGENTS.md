@@ -65,6 +65,9 @@ read it first and treat it as the canonical hub.
   working tree or any memory-tool use.
 - `docs/spec/mapping-journal.md`: read before changing reply correlation
   persistence, journal format, or retention/compaction behavior.
+- `docs/spec/bridge-config.md`: read before changing configuration loading,
+  validation, channel pairing, or config.jsonc. Do not read for unrelated
+  feature work.
 - `docs/spec/cross-platform-service.md`: read before changing service
   install/autostart, `servicectl`, platform builders, or serial discovery.
 - `docs/spec/docker.md`: read before changing Dockerfile or Compose service
