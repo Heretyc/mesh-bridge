@@ -390,10 +390,13 @@ export class BoundedQueue<T> {
   public async drain(timeoutMs: number): Promise<boolean> {
     this.accepting = false;
     if (!this.pumping && this.items.length === 0) return true;
+    // When the idle path wins the race the timeout must be cleared: a ref'd setTimeout left pending
+    // keeps the Node event loop alive, so the service never exits inside WinSW's stop budget.
+    let timer: ReturnType<typeof setTimeout> | undefined;
     return Promise.race([
       new Promise<boolean>((resolve) => this.idleWaiters.push(() => resolve(true))),
-      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), timeoutMs)),
-    ]);
+      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); }),
+    ]).finally(() => clearTimeout(timer));
   }
 
   private async pump(): Promise<void> {
