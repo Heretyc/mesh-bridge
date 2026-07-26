@@ -142,6 +142,9 @@ whitespace, controls, and Unicode remain identifiable.
 
 ### Validation table
 
+The table below is listed in execution order; if this table and the Ordering
+list ever disagree, the Ordering list is authoritative.
+
 | Rule | Exact error message |
 | ---- | ------------------- |
 | `DISCORD_CHANNEL_ID` or `MESHTASTIC_CHANNEL_NAME` present in env | `` `Legacy environment variables ${legacy.join(", ")} are no longer supported; move channel pairs into config.jsonc` `` where `legacy` is ordered `DISCORD_CHANNEL_ID` then `MESHTASTIC_CHANNEL_NAME`, including only those whose values are not `undefined` |
@@ -152,13 +155,13 @@ whitespace, controls, and Unicode remain identifiable.
 | `config.jsonc` absent from repo root | `Missing required configuration file: config.jsonc` |
 | First JSONC parser error | `` `Invalid config.jsonc: ${printParseErrorCode(first.error)} at offset ${first.offset}` `` (`printParseErrorCode` yields the jsonc-parser symbolic code name, e.g. `InvalidSymbol`, `UnexpectedEndOfString`) |
 | Root is null, array, or non-object | `config.jsonc must contain an object` |
-| `channels` absent or non-array | `config.jsonc channels must be an array` |
 | `ipcPort` invalid or out of range | `config.jsonc ipcPort must be an integer from 1024 to 65535` |
 | `queueLimit` invalid or out of range | `config.jsonc queueLimit must be an integer from 1 to 1000` |
 | `ackRetries` invalid or out of range | `config.jsonc ackRetries must be an integer from 0 to 5` |
 | `sendIntervalMs` invalid or out of range | `config.jsonc sendIntervalMs must be an integer from 250 to 60000` |
 | `configTimeoutMs` invalid or out of range | `config.jsonc configTimeoutMs must be an integer from 5000 to 120000` |
 | `dedupTtlMs` invalid or out of range | `config.jsonc dedupTtlMs must be an integer from 10000 to 3600000` |
+| `channels` absent or non-array | `config.jsonc channels must be an array` |
 | `channels` length is 0 or greater than 8 | `` `config.jsonc must define 1 to 8 channel pairs; found ${channels.length}` `` |
 | Entry at index `i` is null, array, or non-object | `` `config.jsonc channels[${index}] must be an object` `` |
 | `discordChannelId` at index `i` is not a string or does not match `^\d{17,20}$` | `` `config.jsonc channels[${index}].discordChannelId ${JSON.stringify(value)} must match ^\\d{17,20}$` `` (template literal; rendered message contains a single backslash, e.g. `... must match ^\d{17,20}$`) |
@@ -193,14 +196,21 @@ is encouraged but the exact text above is the normative form.
 ## IPC-Only Load Path
 
 The TUI uses `loadIpcConfig` to obtain a token and port without starting the
-full bridge. The spec's prohibition on non-token environment reads applies here:
+full bridge. This path validates only what it uses:
 
-- `loadIpcConfig` must read `ipcPort` from `config.jsonc` through the same
-  `parseConfig` pipeline.
-- `loadIpcConfig` must **not** read `IPC_PORT` from the environment; the port
-  value must come from `config.jsonc` only.
-- The only environment variable `loadIpcConfig` may read is `IPC_TOKEN` (via
-  the `.env` load performed by `loadEnvironment`).
+- `loadIpcConfig` reads `IPC_TOKEN` from `.env` (via the `.env` load performed
+  by `loadEnvironment`) and applies the same `IPC_TOKEN` presence, placeholder,
+  and length rules as the full path.
+- It obtains `ipcPort` from `config.jsonc` using the same JSONC parse and the
+  same `ipcPort` range rule (integer 1024–65535) that the full path applies,
+  producing the identical error messages for a missing file, a parse error, or
+  an out-of-range `ipcPort`.
+- It must **not** read `DISCORD_TOKEN`, and must **not** require a valid
+  `channels` array: a malformed, empty, or absent `channels` array must not
+  prevent `loadIpcConfig` from returning `ipcToken` and `ipcPort`.
+- It must **not** read `IPC_PORT` or any other value from the environment.
+- The legacy-env hard cutover still applies on this path: presence of
+  `DISCORD_CHANNEL_ID` or `MESHTASTIC_CHANNEL_NAME` is still a startup failure.
 
 ## Reply Mapping Journals
 
@@ -248,8 +258,10 @@ If two configured `meshtasticChannelName` values resolve to the same device
 channel index, startup fails immediately with:
 
 ```
-Meshtastic channel name collision: ${JSON.stringify(nameA)} and ${JSON.stringify(nameB)} both resolve to device channel index ${index}
+Meshtastic channel name collision: "alpha" and "bravo" both resolve to device channel index 3
 ```
+
+Template: `` `Meshtastic channel name collision: ${JSON.stringify(nameA)} and ${JSON.stringify(nameB)} both resolve to device channel index ${index}` ``
 
 where `nameA` and `nameB` are the conflicting names in config array order and
 `index` is the shared numeric index.
