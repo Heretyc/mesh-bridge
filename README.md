@@ -87,7 +87,7 @@ From a normal terminal in the project directory:
 npm run tui
 ```
 
-The TUI shows link states, serial port, local node ID, resolved channel index, queue depths, counters, and the last 25 sanitized events. It binds only to the service's raw TCP listener on `127.0.0.1`, authenticates with `IPC_TOKEN`, and has no command protocol. Any post-auth client input closes the connection. This is local IPC, not an HTTP/web server.
+The TUI shows link states, serial port, local node ID, the configured pairs each with its resolved channel index or pending, queue depths, counters, and the last 25 sanitized events. It binds only to the service's raw TCP listener on `127.0.0.1`, authenticates with `IPC_TOKEN`, and has no command protocol. Any post-auth client input closes the connection. This is local IPC, not an HTTP/web server.
 
 ## Routing behavior
 

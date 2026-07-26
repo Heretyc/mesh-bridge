@@ -118,6 +118,10 @@ interface MeshSession {
 
 const allowedMentions = { parse: [] as never[], repliedUser: false };
 
+// Operator-visible notice for a fully failed reaction delivery; hoisted so the
+// format-failure and ACK-failure branches cannot drift on its text.
+const REACTION_DELIVERY_FAILED_NOTICE = "Mesh Bridge: reaction delivery failed; 0/1 packets acknowledged.";
+
 function discordMessageBody(message: Message): string {
   const attachmentNames = message.attachments.map((attachment) => safeAttachmentName(attachment.name));
   const mentionNames = {
@@ -527,7 +531,7 @@ export class BridgeService {
     } catch (error) {
       this.status.count("failures");
       this.status.event("error", "MESH_REACTION_FORMAT_FAILED", { referencedId: job.targetDiscordId, reason: reason(error) });
-      await this.reportDiscord(job.discordChannelId, "Mesh Bridge: reaction delivery failed; 0/1 packets acknowledged.");
+      await this.reportDiscord(job.discordChannelId, REACTION_DELIVERY_FAILED_NOTICE);
       return;
     }
 
@@ -551,7 +555,7 @@ export class BridgeService {
       if (this.abort.signal.aborted) return;
       this.status.count("failures");
       this.status.event("error", "MESH_REACTION_DELIVERY_FAILED", { delivered: 0, total: 1 });
-      await this.reportDiscord(job.discordChannelId, "Mesh Bridge: reaction delivery failed; 0/1 packets acknowledged.");
+      await this.reportDiscord(job.discordChannelId, REACTION_DELIVERY_FAILED_NOTICE);
     }
   }
 

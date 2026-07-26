@@ -1,9 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-// service.version is read from package.json at runtime (see docs/spec/bridge-config.md "Version Telemetry"),
-// so tests must derive the expected version from the same manifest instead of hardcoding it.
-const packageVersion = (JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version;
 import { join, posix, win32 } from "node:path";
 import test, { type TestContext } from "node:test";
 import { appendJsonl, atomicReplaceFile, readJsonlTolerant } from "./jsonl.js";
@@ -12,6 +9,9 @@ import { makeRedactor, redactRecord } from "./redact.js";
 import { nextLocalOccurrence, scheduleDailyLocal } from "./schedule.js";
 import { StatusStore } from "./status.js";
 import { TelemetrySink } from "./telemetry.js";
+// service.version is read from package.json at runtime (see docs/spec/bridge-config.md "Version Telemetry"),
+// so tests must derive the expected version from the same manifest instead of hardcoding it.
+const packageVersion = (JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version;
 
 function sandbox(t: TestContext): string {
   const previous = process.env.MESH_BRIDGE_STATE_DIR;

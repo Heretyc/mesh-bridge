@@ -57,7 +57,7 @@ function requireIpcTokenLength(ipcToken: string): void {
 function parseConfigSource(source: string | undefined): Record<string, unknown> {
   if (source === undefined) throw new Error("Missing required configuration file: config.jsonc");
   const errors: ParseError[] = [];
-  const parsed = parse(source, errors, { allowTrailingComma: true, disallowComments: false });
+  const parsed = parse(source, errors, { allowTrailingComma: true });
   const [first] = errors;
   if (first !== undefined) {
     throw new Error(`Invalid config.jsonc: ${printParseErrorCode(first.error)} at offset ${first.offset}`);
