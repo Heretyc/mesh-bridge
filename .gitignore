@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .env
+config.jsonc
 runtime/
 logs/
 *.exe

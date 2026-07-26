@@ -49,6 +49,32 @@ Stop:
 docker compose down
 ```
 
+## config.jsonc Mount
+
+The bridge reads `config.jsonc` from the process working directory (`/app`).
+`docker-compose.yml` bind-mounts the host file read-only:
+
+```yaml
+volumes:
+  - ./config.jsonc:/app/config.jsonc:ro
+```
+
+Two properties of Docker make this mount necessary:
+
+- `env_file` injects variables into the container environment; it does not
+  create any file inside the container.
+- `config.jsonc` is gitignored and is therefore never baked into the image.
+
+If the mount is absent or the host file does not exist, the bridge exits
+immediately at startup with:
+
+```
+Missing required configuration file: config.jsonc
+```
+
+Create `config.jsonc` from `config.jsonc.example` on the host before running
+`docker compose up -d`.
+
 ## Disposable Test Compose
 
 Run:
