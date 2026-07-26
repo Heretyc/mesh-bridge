@@ -849,11 +849,25 @@ export class BridgeService {
   private async shutdown(): Promise<void> {
     this.abort.abort(new Error("shutdown"));
     this.status.event("info", "SERVICE_STOPPING");
-    await Promise.all([this.discordToMesh.drain(15_000), this.meshToDiscord.drain(15_000)]);
-    this.discord?.destroy();
-    await this.mesh?.close().catch(() => undefined);
-    await this.ipc.close();
-    for (const pair of this.pairsByDiscordId.values()) pair.journal.close();
+    // Abort has already told every worker to bail, so the drains only wait out the in-flight item.
+    // Release Discord, the mesh session, and IPC alongside that short, tightly-budgeted wait rather
+    // than strictly after a full-budget drain, so a slow drain can't eat WinSW's whole stop budget
+    // and get the process force-killed. discord.destroy() returns a promise here, so it is awaited.
+    await Promise.all([
+      this.discordToMesh.drain(5_000),
+      this.meshToDiscord.drain(5_000),
+      this.discord?.destroy() ?? Promise.resolve(),
+      this.mesh?.close().catch(() => undefined) ?? Promise.resolve(),
+      this.ipc.close(),
+    ]);
+    // One journal failing to close must not skip the remaining journals or the telemetry close.
+    for (const pair of this.pairsByDiscordId.values()) {
+      try {
+        pair.journal.close();
+      } catch (error) {
+        this.status.event("error", "JOURNAL_CLOSE_FAILED", { discordChannelId: pair.discordChannelId, reason: reason(error) });
+      }
+    }
     this.telemetry.close();
   }
 }

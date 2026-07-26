@@ -643,6 +643,51 @@ test("empty uncorrelated target and ACK exhaustion fail clearly as 0/1", async (
 });
 
 // ---------------------------------------------------------------------------
+// Shutdown: exit cleanly and completely inside the service stop budget.
+// ---------------------------------------------------------------------------
+
+test("shutdown closes every pair's journal even when one journal close throws, then closes telemetry", async (t) => {
+  const internals = newService(t, { channels: twoPairChannels });
+  const pairA = pairOf(internals, CHANNEL_A);
+  const pairB = pairOf(internals, CHANNEL_B);
+  const closed: string[] = [];
+  let telemetryClosed = 0;
+
+  const journalA = pairA.journal as unknown as { close(): void };
+  const journalB = pairB.journal as unknown as { close(): void };
+  const originalCloseA = journalA.close.bind(journalA);
+  const originalCloseB = journalB.close.bind(journalB);
+  const originalTelemetryClose = internals.telemetry.close.bind(internals.telemetry);
+
+  // Pair A's journal throws on close; pair B's and the telemetry close must still run.
+  journalA.close = () => { closed.push(CHANNEL_A); throw new Error("journal A close failed"); };
+  journalB.close = () => { closed.push(CHANNEL_B); };
+  internals.telemetry.close = () => { telemetryClosed += 1; };
+
+  await (internals as unknown as { shutdown(): Promise<void> }).shutdown();
+
+  assert.deepEqual([...closed].sort(), [CHANNEL_A, CHANNEL_B].sort());
+  assert.equal(telemetryClosed, 1);
+  assert.ok(internals.status.snapshot().events.some((event) => event.code === "JOURNAL_CLOSE_FAILED"));
+
+  // Restore the real closers so the fixture teardown runs cleanly.
+  journalA.close = originalCloseA;
+  journalB.close = originalCloseB;
+  internals.telemetry.close = originalTelemetryClose;
+});
+
+test("shutdown completes well within the stop budget in the mocked environment", async (t) => {
+  const internals = newService(t, { channels: twoPairChannels });
+  let guard: ReturnType<typeof setTimeout> | undefined;
+  const outcome = await Promise.race([
+    (internals as unknown as { shutdown(): Promise<void> }).shutdown().then(() => "completed"),
+    new Promise<string>((resolve) => { guard = setTimeout(() => resolve("timed-out"), 2_000); }),
+  ]);
+  clearTimeout(guard);
+  assert.equal(outcome, "completed");
+});
+
+// ---------------------------------------------------------------------------
 // Multi-pair isolation: a message received on one pair must never reach another.
 // ---------------------------------------------------------------------------
 
