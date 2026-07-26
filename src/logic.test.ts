@@ -377,3 +377,28 @@ test("TTL dedup and queue capacity are bounded", async () => {
   assert.deepEqual(handled, [1]);
   assert.ok(depths.includes(0));
 });
+
+test("BoundedQueue.drain leaves no pending timer behind once the idle path wins", async () => {
+  // A leaked, ref'd drain timeout would keep the event loop alive and stop the service exiting,
+  // so assert on the live resource set rather than on wall-clock behaviour.
+  const timeoutsBefore = process.getActiveResourcesInfo().filter((resource) => resource === "Timeout").length;
+  const handled: number[] = [];
+  const queue = new BoundedQueue<number>(4, () => undefined);
+  queue.start(async (item) => { handled.push(item); });
+  assert.equal(queue.enqueue(1), true);
+  // A generous budget: were the timeout not cleared, this 60s Timeout would outlive the resolved drain.
+  assert.equal(await queue.drain(60_000), true);
+  assert.deepEqual(handled, [1]);
+  const timeoutsAfter = process.getActiveResourcesInfo().filter((resource) => resource === "Timeout").length;
+  assert.equal(timeoutsAfter, timeoutsBefore);
+});
+
+test("BoundedQueue.drain still honours its timeout when the queue never drains", async () => {
+  let releaseWorker!: () => void;
+  const queue = new BoundedQueue<number>(4, () => undefined);
+  queue.start(() => new Promise<void>((resolve) => { releaseWorker = resolve; }));
+  assert.equal(queue.enqueue(1), true);
+  // The worker is still hung, so the bounded wait must expire and report the incomplete drain.
+  assert.equal(await queue.drain(20), false);
+  releaseWorker(); // let the hung worker settle so nothing lingers after the test
+});
