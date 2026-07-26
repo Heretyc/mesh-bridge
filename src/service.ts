@@ -211,7 +211,7 @@ export class BridgeService {
   private lastMeshSend = 0;
 
   public constructor(private readonly config: Config) {
-    this.ipc = new IpcServer(config.ipcPort, config.ipcToken, this.status);
+    this.ipc = new IpcServer(config.ipcPort, config.ipcToken, this.status, () => this.abort.abort(new Error("IPC_SHUTDOWN")));
     this.telemetry = new TelemetrySink({
       logFile: join(logDir(), "telemetry.jsonl"),
       secrets: [config.discordToken, config.ipcToken],

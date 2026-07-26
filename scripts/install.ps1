@@ -40,9 +40,11 @@ elseif ((Get-FileHash -Algorithm SHA256 -LiteralPath $wrapper).Hash -ne $expecte
     throw 'Existing runtime\MeshBridge.exe is not the pinned WinSW 2.12.0 binary.'
 }
 
+$powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $xmlNode = [Security.SecurityElement]::Escape($node)
 $xmlBase = [Security.SecurityElement]::Escape($base)
 $xmlScript = [Security.SecurityElement]::Escape($serviceJs)
+$xmlPowershell = [Security.SecurityElement]::Escape($powershell)
 @"
 <service>
   <id>MeshBridge</id>
@@ -57,6 +59,8 @@ $xmlScript = [Security.SecurityElement]::Escape($serviceJs)
     <domain>NT AUTHORITY</domain>
     <user>LocalService</user>
   </serviceaccount>
+  <stopexecutable>$xmlPowershell</stopexecutable>
+  <stoparguments>-NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;$xmlBase\scripts\send-shutdown.ps1&quot;</stoparguments>
   <stoptimeout>20 sec</stoptimeout>
   <onfailure action="restart" delay="10 sec" />
   <resetfailure>1 hour</resetfailure>
