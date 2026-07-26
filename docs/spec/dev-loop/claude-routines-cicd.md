@@ -6,8 +6,11 @@ Status: normative CI/CD mapping for this repository.
 
 Claude Code Routines are the canonical CI/CD path for this repository. GitHub
 Actions exists only as the GitHub-standard dispatch bridge and signal that a
-routine was started. The workflow file is
-`.github/workflows/claude-routine.yml`.
+routine was started. The dispatch workflow file is
+`.github/workflows/claude-routine.yml`. A second bridge,
+`.github/workflows/claude-routine-verdict.yml`, translates the routine's PR
+report comment into the `claude-routine-verdict` commit status so the verdict
+itself is machine-enforceable.
 
 Routines are research-preview infrastructure. If Anthropic changes routine API,
 trigger behavior, limits, or completion reporting, stop and update this SOP
@@ -55,6 +58,20 @@ citations, or wrapper text.
 - not claim that routine completion succeeded merely because dispatch succeeded
 - mark all GitHub event fields as untrusted metadata for the routine
 
+`.github/workflows/claude-routine-verdict.yml` must:
+
+- trigger only on `issue_comment` (created, edited) and run only for PR
+  comments whose author association is `OWNER`
+- use least-privilege `GITHUB_TOKEN` permissions (`statuses: write`,
+  `pull-requests: read`) with no checkout and no execution of untrusted code
+- parse the comment body as data only: require the `## Claude Routine CI/CD`
+  header plus parseable `Status:` and `Target SHA:` lines, else do nothing
+- post the `claude-routine-verdict` commit status on the PR head SHA only when
+  the report's target SHA matches the current head SHA (`pass` maps to
+  `success`; `fail` and `blocked` map to `failure`)
+- fail closed: a missing, malformed, or stale report leaves the verdict status
+  unset, which keeps the PR blocked while the context is required
+
 ## Routine Report Format
 
 The routine must post or preserve a report of this shape. It is an illustrative
@@ -93,13 +110,23 @@ Target SHA: <sha checked out for validation>
 
 ## Enforcement
 
-- Branch protection or rulesets should require `claude-routine-dispatch` only on
-  GitHub plans where private-repository protections are actually enforced.
+- Branch protection or rulesets should require `claude-routine-dispatch` and
+  `claude-routine-verdict` only on GitHub plans where private-repository
+  protections are actually enforced.
 - On private repositories where GitHub shows a plan-gating warning, do not treat
   rulesets or branch protection as enforceable. Maintainers must manually block
   merges unless this SOP's routine-report gate passes.
-- The required check proves that GitHub successfully fired the routine. It does
-  not prove that the routine completed successfully.
+- The `claude-routine-dispatch` check proves that GitHub successfully fired the
+  routine. It does not prove that the routine completed successfully. The
+  `claude-routine-verdict` status proves the routine's latest report for the
+  current head SHA carries `Status: pass`.
+- The verdict bridge trusts owner-authored report comments, and the routine
+  itself posts as the owner account. The verdict status is therefore a
+  mechanical floor, not an independent approval: it blocks merges that lack a
+  passing report, but it cannot prove the report is trustworthy. A routine
+  manipulated through untrusted PR content could still post `Status: pass`, so
+  the human-review requirement below stays normative and the merge decision
+  stays with the owner.
 - No PR may merge unless the latest Claude Routine report for the current head
   SHA has `Status: pass`, or the owner explicitly approves an emergency override
   that names the risk and accepted bypass.
@@ -109,6 +136,9 @@ Target SHA: <sha checked out for validation>
   merge.
 - If direct GitHub-event routines are enabled in Claude, keep the workflow
   bridge anyway so GitHub has a required status check.
+- The verdict status is posted per PR head SHA. If a merge queue is enabled,
+  merge-group SHAs will not carry it; extend the verdict bridge before making
+  it required for merge groups.
 - Fork and Dependabot `pull_request` runs do not receive normal repository
   secrets. They fail closed unless a maintainer moves the change to a trusted
   branch, performs a trusted `workflow_dispatch`, or uses an owner-approved
