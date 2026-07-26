@@ -687,6 +687,73 @@ test("shutdown completes well within the stop budget in the mocked environment",
   assert.equal(outcome, "completed");
 });
 
+// A drain that runs to its full timeout must NOT delay releasing Discord/mesh/IPC: shutdown() releases
+// those resources concurrently with the bounded drain wait, not strictly after it. If the change is
+// reverted to "await the full drain, THEN release", discord.destroy() is invoked only after the drain
+// timeout (was 15s), so the prompt-release assertion below fails. A hung worker keeps the drain from
+// finishing early, which is exactly what makes this test sensitive to the ordering.
+test("shutdown releases resources concurrently with a still-pending drain", async (t) => {
+  const internals = newService(t);
+
+  // A worker that never settles keeps one item in-flight, so drain() can never go idle and must run to
+  // its internal timeout. This is what an instantly-draining mocked queue cannot exercise.
+  const queue = internals.discordToMesh as unknown as {
+    start(worker: (item: unknown) => Promise<void>): void;
+    enqueue(item: unknown): boolean;
+  };
+  queue.start(() => new Promise<void>(() => undefined));
+  assert.equal(queue.enqueue({ hung: true }), true);
+
+  const svc = internals as unknown as {
+    discord: { destroy(): Promise<void> } | undefined;
+    mesh: { close(): Promise<void> } | undefined;
+    ipc: { close(): Promise<void> };
+    shutdown(): Promise<void>;
+  };
+
+  let destroyedAt: number | undefined;
+  let meshClosedAt: number | undefined;
+  let ipcClosedAt: number | undefined;
+  let signalDestroyed: () => void;
+  const destroyed = new Promise<void>((resolve) => { signalDestroyed = resolve; });
+
+  const originalIpcClose = svc.ipc.close.bind(svc.ipc);
+  const started = Date.now();
+  const elapsed = (): number => Date.now() - started;
+
+  svc.discord = { destroy: async () => { destroyedAt = elapsed(); signalDestroyed(); } };
+  svc.mesh = { close: async () => { meshClosedAt = elapsed(); } };
+  svc.ipc.close = async () => { ipcClosedAt = elapsed(); await originalIpcClose(); };
+
+  const settledAt = svc.shutdown().then(() => elapsed());
+
+  // The release must happen promptly, WHILE the drain is still pending — so we can prove it without
+  // waiting out the full drain budget. Under the reverted (sequential) ordering the drain's timeout has
+  // to elapse first, so "destroyed" would lose this race.
+  const promptWindowMs = 1_500;
+  let promptGuard: ReturnType<typeof setTimeout> | undefined;
+  const outcome = await Promise.race([
+    destroyed.then(() => "released"),
+    new Promise<string>((resolve) => { promptGuard = setTimeout(() => resolve("waited-for-drain"), promptWindowMs); }),
+  ]);
+  clearTimeout(promptGuard);
+  assert.equal(outcome, "released", "discord.destroy() must run concurrently with the pending drain, not after it");
+  assert.ok(destroyedAt !== undefined && destroyedAt < promptWindowMs, `discord destroyed promptly (at ${String(destroyedAt)}ms)`);
+
+  // Second revert signal: shutdown itself settles near the 5s drain budget, well under the old 15s wait.
+  let settleGuard: ReturnType<typeof setTimeout> | undefined;
+  const settle = await Promise.race([
+    settledAt.then(() => "settled"),
+    new Promise<string>((resolve) => { settleGuard = setTimeout(() => resolve("too-slow"), 10_000); }),
+  ]);
+  clearTimeout(settleGuard);
+  assert.equal(settle, "settled", "shutdown() must settle at the drain budget, not after the old full-length drain");
+
+  // The mesh and IPC releases are part of the same concurrent batch, so they are prompt as well.
+  assert.ok(meshClosedAt !== undefined && meshClosedAt < promptWindowMs, `mesh closed promptly (at ${String(meshClosedAt)}ms)`);
+  assert.ok(ipcClosedAt !== undefined && ipcClosedAt < promptWindowMs, `ipc closed promptly (at ${String(ipcClosedAt)}ms)`);
+});
+
 // ---------------------------------------------------------------------------
 // Multi-pair isolation: a message received on one pair must never reach another.
 // ---------------------------------------------------------------------------
