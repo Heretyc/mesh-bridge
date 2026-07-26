@@ -61,8 +61,11 @@ export interface Config {
 ```
 
 The parsed `Config` is fully populated. The JSONC root is validated as
-`unknown`; the implementation must not export a second schema class. Only
-consumed properties are validated; unrecognised keys have no effect.
+`unknown`; validation is performed by hand inside `parseConfig` — do not
+introduce a JSON-Schema object, a generated validator, or any additional
+exported `Config`-shaped type or schema class beyond the single `Config`
+interface. Only consumed properties are validated; unrecognised keys have no
+effect.
 
 ## Tuning Properties
 
@@ -99,6 +102,26 @@ Every `discordChannelId` must be globally unique across all entries. Every
 enforces no fan-in and no fan-out: one Discord channel pairs with exactly one
 Meshtastic channel and vice versa.
 
+#### Rejected example
+
+The following config is invalid because two entries share the same
+`meshtasticChannelName`:
+
+```jsonc
+{
+  "channels": [
+    { "discordChannelId": "111111111111111111", "meshtasticChannelName": "private" },
+    { "discordChannelId": "222222222222222222", "meshtasticChannelName": "private" }
+  ]
+}
+```
+
+Rejection message:
+
+```
+Duplicate meshtasticChannelName "private" in config.jsonc
+```
+
 ## Fail-Fast Validation
 
 The implementation must apply validations in the exact order given here and fail
@@ -111,7 +134,7 @@ whitespace, controls, and Unicode remain identifiable.
 1. Legacy env cutover check
 2. Required secrets and token-length checks
 3. File existence, JSONC parse, and root-type check
-4. Global integer properties
+4. Global integer properties (in order: `ipcPort`, `queueLimit`, `ackRetries`, `sendIntervalMs`, `configTimeoutMs`, `dedupTtlMs`)
 5. Channel array presence and count
 6. Per-entry shape, ID format, name byte length (in array order)
 7. Duplicate Discord ID check (in array order)
@@ -122,12 +145,12 @@ whitespace, controls, and Unicode remain identifiable.
 | Rule | Exact error message |
 | ---- | ------------------- |
 | `DISCORD_CHANNEL_ID` or `MESHTASTIC_CHANNEL_NAME` present in env | `` `Legacy environment variables ${legacy.join(", ")} are no longer supported; move channel pairs into config.jsonc` `` where `legacy` is ordered `DISCORD_CHANNEL_ID` then `MESHTASTIC_CHANNEL_NAME`, including only those whose values are not `undefined` |
-| `DISCORD_TOKEN` missing, blank, or placeholder | `Missing required configuration: DISCORD_TOKEN` |
-| `IPC_TOKEN` missing, blank, or placeholder | `Missing required configuration: IPC_TOKEN` |
-| `IPC_TOKEN` shorter than 32 characters | `IPC_TOKEN must be at least 32 characters` |
-| `DISCORD_TOKEN` shorter than 30 characters | `DISCORD_TOKEN is too short to be a bot token` |
+| `DISCORD_TOKEN` missing, blank, or placeholder (trimmed value matches `/^(replace|change)[-_ ]?me$/i`, case-insensitively) | `Missing required configuration: DISCORD_TOKEN` |
+| `IPC_TOKEN` missing, blank, or placeholder (trimmed value matches `/^(replace|change)[-_ ]?me$/i`, case-insensitively) | `Missing required configuration: IPC_TOKEN` |
+| `DISCORD_TOKEN` shorter than 30 UTF-16 code units (`String.prototype.length`) | `DISCORD_TOKEN is too short to be a bot token` |
+| `IPC_TOKEN` shorter than 32 UTF-16 code units (`String.prototype.length`) | `IPC_TOKEN must be at least 32 characters` |
 | `config.jsonc` absent from repo root | `Missing required configuration file: config.jsonc` |
-| First JSONC parser error | `` `Invalid config.jsonc: ${printParseErrorCode(first.error)} at offset ${first.offset}` `` |
+| First JSONC parser error | `` `Invalid config.jsonc: ${printParseErrorCode(first.error)} at offset ${first.offset}` `` (`printParseErrorCode` yields the jsonc-parser symbolic code name, e.g. `InvalidSymbol`, `UnexpectedEndOfString`) |
 | Root is null, array, or non-object | `config.jsonc must contain an object` |
 | `channels` absent or non-array | `config.jsonc channels must be an array` |
 | `ipcPort` invalid or out of range | `config.jsonc ipcPort must be an integer from 1024 to 65535` |
@@ -138,7 +161,7 @@ whitespace, controls, and Unicode remain identifiable.
 | `dedupTtlMs` invalid or out of range | `config.jsonc dedupTtlMs must be an integer from 10000 to 3600000` |
 | `channels` length is 0 or greater than 8 | `` `config.jsonc must define 1 to 8 channel pairs; found ${channels.length}` `` |
 | Entry at index `i` is null, array, or non-object | `` `config.jsonc channels[${index}] must be an object` `` |
-| `discordChannelId` at index `i` is not a string or does not match `^\d{17,20}$` | `` `config.jsonc channels[${index}].discordChannelId ${JSON.stringify(value)} must match ^\\d{17,20}$` `` |
+| `discordChannelId` at index `i` is not a string or does not match `^\d{17,20}$` | `` `config.jsonc channels[${index}].discordChannelId ${JSON.stringify(value)} must match ^\\d{17,20}$` `` (template literal; rendered message contains a single backslash, e.g. `... must match ^\d{17,20}$`) |
 | `meshtasticChannelName` at index `i` is not a string, is empty, or exceeds 11 UTF-8 bytes | `` `config.jsonc channels[${index}].meshtasticChannelName ${JSON.stringify(value)} must be 1 to 11 UTF-8 bytes` `` |
 | Duplicate `discordChannelId` value | `` `Duplicate discordChannelId ${JSON.stringify(value)} in config.jsonc` `` |
 | Duplicate `meshtasticChannelName` value | `` `Duplicate meshtasticChannelName ${JSON.stringify(value)} in config.jsonc` `` |
@@ -166,6 +189,18 @@ Legacy environment variables DISCORD_CHANNEL_ID, MESHTASTIC_CHANNEL_NAME are no 
 Operators must remove these variables from `.env` and all deployment
 environments. Pointing operators to `config.jsonc.example` in the error message
 is encouraged but the exact text above is the normative form.
+
+## IPC-Only Load Path
+
+The TUI uses `loadIpcConfig` to obtain a token and port without starting the
+full bridge. The spec's prohibition on non-token environment reads applies here:
+
+- `loadIpcConfig` must read `ipcPort` from `config.jsonc` through the same
+  `parseConfig` pipeline.
+- `loadIpcConfig` must **not** read `IPC_PORT` from the environment; the port
+  value must come from `config.jsonc` only.
+- The only environment variable `loadIpcConfig` may read is `IPC_TOKEN` (via
+  the `.env` load performed by `loadEnvironment`).
 
 ## Reply Mapping Journals
 
@@ -204,6 +239,21 @@ tag. The worker re-resolves the pair from the tag at delivery time.
 `pairsByMeshChannel`. `packet.channel` is looked up in `pairsByMeshChannel`
 before decode or dedup. No entry means ignore.
 
+If a configured `meshtasticChannelName` does not resolve to a device channel
+index (name absent from the device channel list or device not yet seen), that
+pair stays pending and receives no Mesh → Discord traffic; the TUI and
+`status` command display it as `(index pending)`.
+
+If two configured `meshtasticChannelName` values resolve to the same device
+channel index, startup fails immediately with:
+
+```
+Meshtastic channel name collision: ${JSON.stringify(nameA)} and ${JSON.stringify(nameB)} both resolve to device channel index ${index}
+```
+
+where `nameA` and `nameB` are the conflicting names in config array order and
+`index` is the shared numeric index.
+
 ### Dedup key namespacing
 
 Dedup keys include the pair's `discordChannelId` to prevent collision across
@@ -213,7 +263,7 @@ pairs:
 | ----- | --- |
 | Discord message | `discord:${discordChannelId}:${message.id}` |
 | Mesh packet (nonzero ID) | `mesh:${discordChannelId}:${packet.from}:${packet.id}` |
-| Mesh packet (ID zero) | `mesh:${discordChannelId}:${packet.from}:0:${packet.rxTime}:${sha256PayloadPrefix}` |
+| Mesh packet (ID zero) | `mesh:${discordChannelId}:${packet.from}:0:${packet.rxTime}:${sha256PayloadPrefix}` (`sha256PayloadPrefix` is the first 16 lowercase hex characters of the SHA-256 of the decoded packet payload bytes) |
 
 Global state (one queue per direction, one send clock, one Discord client, one
 Meshtastic device, one telemetry sink, one IPC server, global counters) is
