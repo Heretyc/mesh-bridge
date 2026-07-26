@@ -211,7 +211,7 @@ export class BridgeService {
   private lastMeshSend = 0;
 
   public constructor(private readonly config: Config) {
-    this.ipc = new IpcServer(config.ipcPort, config.ipcToken, this.status);
+    this.ipc = new IpcServer(config.ipcPort, config.ipcToken, this.status, () => this.abort.abort(new Error("IPC_SHUTDOWN")));
     this.telemetry = new TelemetrySink({
       logFile: join(logDir(), "telemetry.jsonl"),
       secrets: [config.discordToken, config.ipcToken],
@@ -704,7 +704,14 @@ export class BridgeService {
         close: async () => {
           const graceful = device.disconnect().catch(() => undefined);
           await Promise.race([graceful, delay(1_000)]);
-          await transport.disconnect().catch(() => undefined);
+          // serial disconnect can hang; don't let it eat the stop budget.
+          let timer: NodeJS.Timeout | undefined;
+          const deadline = new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, 3_000);
+            timer.unref();
+          });
+          await Promise.race([transport.disconnect().catch(() => undefined), deadline]);
+          clearTimeout(timer);
         },
       };
       return session;

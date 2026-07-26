@@ -123,7 +123,12 @@ export class IpcServer {
     for (const socket of this.clients) socket.write(line);
   };
 
-  public constructor(private readonly port: number, private readonly token: string, private readonly store: StatusStore) {}
+  public constructor(
+    private readonly port: number,
+    private readonly token: string,
+    private readonly store: StatusStore,
+    private readonly onShutdown?: () => void,
+  ) {}
 
   public start(): Promise<void> {
     return new Promise((resolveStart, reject) => {
@@ -162,7 +167,24 @@ export class IpcServer {
         return;
       }
       socket.setTimeout(0);
-      socket.on("data", () => socket.destroy());
+      let commands = "";
+      const onCommand = (commandChunk: Buffer): void => {
+        commands += commandChunk.toString("utf8");
+        if (commands.length > 256) {
+          socket.destroy();
+          return;
+        }
+        const commandEnd = commands.indexOf("\n");
+        if (commandEnd < 0) return;
+        socket.off("data", onCommand);
+        if (commands.slice(0, commandEnd).replace(/\r$/u, "") === "shutdown" && this.onShutdown) {
+          this.store.event("info", "IPC_SHUTDOWN_REQUESTED");
+          this.onShutdown();
+        } else {
+          socket.destroy();
+        }
+      };
+      socket.on("data", onCommand);
       socket.on("close", () => this.clients.delete(socket));
       this.clients.add(socket);
       socket.write(`${JSON.stringify(this.store.snapshot())}\n`);

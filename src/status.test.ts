@@ -35,6 +35,65 @@ function readFirstLine(port: number, token: string): Promise<string> {
   });
 }
 
+function sendCommand(port: number, token: string, command: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection({ host: "127.0.0.1", port });
+    const timer = setTimeout(() => socket.destroy(new Error("IPC test timeout")), 2_000);
+    let sent = false;
+    socket.on("connect", () => socket.write(`${token}\n`));
+    socket.on("data", () => {
+      if (sent) return;
+      sent = true;
+      socket.write(`${command}\n`);
+    });
+    socket.on("error", () => undefined);
+    socket.on("close", () => {
+      clearTimeout(timer);
+      sent ? resolve() : reject(new Error("IPC authentication rejected"));
+    });
+  });
+}
+
+test("authenticated IPC shutdown command invokes the shutdown hook exactly once", async () => {
+  const port = await freePort();
+  const token = "t".repeat(64);
+  const store = new StatusStore();
+  let calls = 0;
+  let resolveShutdown!: () => void;
+  const requested = new Promise<void>((resolveRequest) => (resolveShutdown = resolveRequest));
+  const ipc = new IpcServer(port, token, store, () => {
+    calls += 1;
+    resolveShutdown();
+  });
+  await ipc.start();
+  try {
+    const settled = sendCommand(port, token, "shutdown");
+    await requested;
+    await ipc.close();
+    await settled;
+    assert.equal(calls, 1);
+  } finally {
+    await ipc.close();
+  }
+});
+
+test("unknown IPC commands drop the client without invoking the shutdown hook", async () => {
+  const port = await freePort();
+  const token = "t".repeat(64);
+  const store = new StatusStore();
+  let calls = 0;
+  const ipc = new IpcServer(port, token, store, () => {
+    calls += 1;
+  });
+  await ipc.start();
+  try {
+    await sendCommand(port, token, "reboot");
+    assert.equal(calls, 0);
+  } finally {
+    await ipc.close();
+  }
+});
+
 test("local IPC authenticates and exposes only sanitized status", async () => {
   const port = await freePort();
   const token = "t".repeat(64);
