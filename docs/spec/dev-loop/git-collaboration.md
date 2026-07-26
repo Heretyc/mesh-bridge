@@ -79,16 +79,21 @@ in `AGENTS.md`. Agent execution details live in `agents/GIT_COLLABORATION.md`.
     branch rulesets or branch protection only where the GitHub account plan
     actually enforces private-repository protections.
 30. Protected branches must require PRs, required checks, resolved
-    conversations, at least one independent approval, code-owner review for
-    owned paths, blocked force-pushes, and blocked deletion.
+    conversations, an approval gate, code-owner review for owned paths, blocked
+    force-pushes, and blocked deletion. The approval gate requires at least one
+    independent approval unless the PR is authored by repository owner
+    `@Heretyc` or is an agent-authored PR explicitly owner-authorized for that
+    change.
 31. Busy protected branches must use merge queue, and required CI must include
     `merge_group` before merge queue is required.
 32. No PR may merge while draft, failing/missing required checks, conflicted,
-    stale, unsafe, superseded, lacking approval, or carrying unresolved changes.
+    stale, unsafe, superseded, lacking the approval required by directive 30, or
+    carrying unresolved changes.
 33. No PR may merge unless the latest Claude Routine report for the current head
     SHA has `Status: pass`, or the owner approves an emergency override.
-34. Agent-authored PRs must pass the same CI and human review gates as human
-    PRs. Agents do not approve or merge their own work.
+34. Agent-authored PRs must pass the same CI and merge gates as human PRs.
+    Agents do not approve or merge their own work; explicit owner authorization
+    may satisfy directive 30's approval gate for that agent PR only.
 35. Release branches accept only stabilization, release metadata, backports, and
     approved hotfixes. Feature work targets topic branches from default branch.
 36. Hotfixes start from the oldest supported affected release/maintenance branch
