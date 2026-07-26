@@ -33,6 +33,7 @@ import {
   formatUnmappedReactionForMesh,
   hasRequiredDiscordPermissions,
   isMeshTapback,
+  type MeshChannelCandidate,
   meshTapbackEmoji,
   replyIdForChunk,
   resolveDiscordMentions,
@@ -129,6 +130,42 @@ function discordMessageBody(message: Message): string {
 
 function reason(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Resolve every configured pair against a device's channel candidates. Pure: touches no serial port, no I/O, no class
+ * state — exported so the spec's collision and pending semantics can be unit-tested without opening a device.
+ *
+ * Pairs are processed in iteration (config array) order. A name absent from the device list (`resolveEncryptedChannel`
+ * throws "was not found") leaves its pair PENDING — it is simply omitted from the result and receives no Mesh->Discord
+ * traffic. Two names resolving to the SAME device index is an immediate startup failure with the spec's exact message,
+ * where the earlier config-order name is the `owner` named first. Every other `resolveEncryptedChannel` failure
+ * (ambiguous / not encrypted / invalid index) is re-thrown unchanged so it stays FATAL.
+ */
+export function resolveChannelPairs<T extends { meshtasticChannelName: string }>(
+  pairs: Iterable<T>,
+  channels: MeshChannelCandidate[],
+): Array<[number, T]> {
+  const resolvedPairs: Array<[number, T]> = [];
+  const ownerByIndex = new Map<number, T>();
+  for (const pair of pairs) {
+    let index: number;
+    try {
+      index = resolveEncryptedChannel(channels, pair.meshtasticChannelName);
+    } catch (error) {
+      if (/was not found/i.test(reason(error))) continue; // pending: name absent from this device's channel list
+      throw error; // ambiguous / invalid index / unencrypted remain fatal (converted by the caller's outer catch)
+    }
+    const owner = ownerByIndex.get(index);
+    if (owner !== undefined) {
+      throw new FatalConfigurationError(
+        `Meshtastic channel name collision: ${JSON.stringify(owner.meshtasticChannelName)} and ${JSON.stringify(pair.meshtasticChannelName)} both resolve to device channel index ${index}`,
+      );
+    }
+    ownerByIndex.set(index, pair);
+    resolvedPairs.push([index, pair]);
+  }
+  return resolvedPairs;
 }
 
 async function disconnectRejectedProbe(transport: TransportNodeSerial): Promise<void> {
@@ -636,25 +673,9 @@ export class BridgeService {
       }));
       // Resolve every configured pair against this device. A name absent from the device leaves its pair
       // pending (no Mesh->Discord traffic); two names sharing one index is an immediate startup failure.
-      const resolvedPairs: Array<[number, PairState]> = [];
-      const ownerByIndex = new Map<number, PairState>();
-      for (const pair of this.pairsByDiscordId.values()) {
-        let index: number;
-        try {
-          index = resolveEncryptedChannel(candidates, pair.meshtasticChannelName);
-        } catch (error) {
-          if (/was not found/i.test(reason(error))) continue; // pending: name absent from this device's channel list
-          throw error; // ambiguous / invalid index / unencrypted remain fatal (converted by the outer catch)
-        }
-        const owner = ownerByIndex.get(index);
-        if (owner !== undefined) {
-          throw new FatalConfigurationError(
-            `Meshtastic channel name collision: ${JSON.stringify(owner.meshtasticChannelName)} and ${JSON.stringify(pair.meshtasticChannelName)} both resolve to device channel index ${index}`,
-          );
-        }
-        ownerByIndex.set(index, pair);
-        resolvedPairs.push([index, pair]);
-      }
+      // The resolution is a pure function (unit-tested in service.test.ts); the outer catch still converts
+      // ambiguous / not-encrypted / invalid-index errors it re-throws into FatalConfigurationError.
+      const resolvedPairs = resolveChannelPairs(this.pairsByDiscordId.values(), candidates);
       const session: MeshSession = {
         device,
         resolvedPairs,

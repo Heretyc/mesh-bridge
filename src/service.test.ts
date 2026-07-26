@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import type { Config } from "./config.js";
 import { ReplyCorrelator, splitDiscordForMesh } from "./logic.js";
-import { BridgeService } from "./service.js";
+import { BridgeService, resolveChannelPairs } from "./service.js";
 import type { StatusStore, StatusSnapshot } from "./status.js";
 
 // service.version is read from package.json at runtime; tests derive it from the same manifest, never hardcode it.
@@ -762,4 +762,82 @@ test("multi-pair: an unresolved pair stays pending and receives no Mesh->Discord
   const pairs = internals.status.snapshot().connections.channelPairs;
   assert.equal(pairs.find((entry) => entry.discordChannelId === CHANNEL_A)?.meshChannelIndex, 3);
   assert.equal(pairs.find((entry) => entry.discordChannelId === CHANNEL_B)?.meshChannelIndex, null);
+});
+
+// --- resolveChannelPairs: the pure pair-resolution seam extracted from BridgeService.openMeshAt ---------------------
+// Builds one MeshChannelCandidate. Defaults to an encrypted secondary channel so resolveEncryptedChannel accepts it;
+// callers override psk (unencrypted), role, or index to exercise the fatal branches.
+function meshCandidate(
+  index: number,
+  name: string,
+  opts: { role?: number; psk?: Uint8Array } = {},
+): { index: number; role: number; name: string; psk: Uint8Array } {
+  return { index, role: opts.role ?? 1, name, psk: opts.psk ?? new Uint8Array([1, 2, 3]) };
+}
+
+test("resolveChannelPairs: two distinct names resolving to the same device index is a fatal startup collision", () => {
+  const channels = [meshCandidate(3, "alpha"), meshCandidate(3, "bravo")];
+  const pairs = [
+    { discordChannelId: CHANNEL_A, meshtasticChannelName: "alpha" },
+    { discordChannelId: CHANNEL_B, meshtasticChannelName: "bravo" },
+  ];
+  assert.throws(
+    () => resolveChannelPairs(pairs, channels),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      // Full spec string, verbatim.
+      assert.equal(
+        error.message,
+        `Meshtastic channel name collision: "alpha" and "bravo" both resolve to device channel index 3`,
+      );
+      // The earlier config-order name ("alpha") is the owner named first.
+      assert.ok(error.message.indexOf(`"alpha"`) < error.message.indexOf(`"bravo"`));
+      return true;
+    },
+  );
+});
+
+test("resolveChannelPairs: a name absent from the device leaves its pair pending while the rest resolve", () => {
+  const channels = [meshCandidate(2, "alpha")]; // "ghost" is not on the device.
+  const pairs = [
+    { discordChannelId: CHANNEL_A, meshtasticChannelName: "alpha" },
+    { discordChannelId: CHANNEL_B, meshtasticChannelName: "ghost" },
+  ];
+  const resolved = resolveChannelPairs(pairs, channels);
+  // The unresolved pair is simply omitted (pending) — not an error — and does not disturb the resolved one.
+  assert.equal(resolved.length, 1);
+  assert.equal(resolved[0]![0], 2);
+  assert.equal(resolved[0]![1].discordChannelId, CHANNEL_A);
+  assert.ok(!resolved.some(([, pair]) => pair.meshtasticChannelName === "ghost"));
+});
+
+test("resolveChannelPairs: two names resolving to distinct indexes both resolve with the correct index", () => {
+  const channels = [meshCandidate(1, "alpha"), meshCandidate(5, "bravo")];
+  const pairs = [
+    { discordChannelId: CHANNEL_A, meshtasticChannelName: "alpha" },
+    { discordChannelId: CHANNEL_B, meshtasticChannelName: "bravo" },
+  ];
+  const resolved = resolveChannelPairs(pairs, channels);
+  assert.equal(resolved.length, 2);
+  const indexByName = new Map(resolved.map(([index, pair]) => [pair.meshtasticChannelName, index]));
+  assert.equal(indexByName.get("alpha"), 1);
+  assert.equal(indexByName.get("bravo"), 5);
+});
+
+test("resolveChannelPairs: ambiguous, unencrypted, or invalid-index names stay fatal, never pending", () => {
+  // Unencrypted (empty psk) guards the encryption invariant: it must throw, never silently drop to pending.
+  assert.throws(
+    () => resolveChannelPairs([{ meshtasticChannelName: "open" }], [meshCandidate(1, "open", { psk: new Uint8Array() })]),
+    /is not encrypted/,
+  );
+  // Ambiguous (the same name on two device channels): fatal, not pending.
+  assert.throws(
+    () => resolveChannelPairs([{ meshtasticChannelName: "dup" }], [meshCandidate(1, "dup"), meshCandidate(2, "dup")]),
+    /is ambiguous/,
+  );
+  // Invalid index (outside 0..7): fatal, not pending.
+  assert.throws(
+    () => resolveChannelPairs([{ meshtasticChannelName: "far" }], [meshCandidate(9, "far")]),
+    /has invalid index/,
+  );
 });
