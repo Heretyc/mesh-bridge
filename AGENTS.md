@@ -54,6 +54,9 @@ read it first and treat it as the canonical hub.
 - `docs/incidents/2026-07-24-local-landing.md`: read when auditing why the
   2026-07-24 local landing bypassed the PR, CI, self-merge, or prompt-review
   gates.
+- `docs/incidents/2026-07-26-durability-policy-ratification.md`: read when
+  verifying the owner authorization behind the "user-ratified" Durability policy
+  directive, or the P3-003 not-a-bug ruling.
 - `docs/spec/safety-scope.md`: read when an interactive human prompt is over
   150 words; asks for structural, architectural, debug, troubleshooting, or
   root-cause work; or may require pausing, clarification, consent, refusal, or
@@ -111,6 +114,9 @@ read it first and treat it as the canonical hub.
   under `docs/spec`, skills, policy gates, CI/CD agent instructions, or text
   future agents/maintainers must follow. Do not read for one-off task notes,
   changelogs, or agent-state markdown unless they contain reusable rules.
+- `docs/spec/prompt-review/records/2026-07-26-durability-policy-and-bridge-config.md`:
+  read when auditing the 8-perspective review of the Durability policy directive
+  and bridge-config specs, or as a filled-in example of the review-record format.
 - `docs/spec/otel-logging.md`: read before changing on-disk log format,
   redaction, retention/prune, state-dir resolution, or stable event codes.
 - `docs/spec/safety-scope/00-scope-and-cascade.md`: read when determining
@@ -132,7 +138,9 @@ read it first and treat it as the canonical hub.
   with loud, repeating alerts is standard operating procedure; full startup
   abort or shutdown is reserved for genuinely unrecoverable states (e.g.
   invalid credentials). Full spec: `docs/spec/bridge-config/routing-isolation.md`
-  (graceful degradation & loud alerting).
+  (graceful degradation & loud alerting). Ratification record (owner
+  authorization verbatim):
+  `docs/incidents/2026-07-26-durability-policy-ratification.md`.
 - Before any file edit or git write action, inspect
   `git status --short --branch`.
 - No external memory writes ever, no exceptions — no outside-repo persistence of
