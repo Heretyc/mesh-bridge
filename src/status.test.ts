@@ -77,6 +77,33 @@ test("authenticated IPC shutdown command invokes the shutdown hook exactly once"
   }
 });
 
+test("shutdown command in the same segment as the token invokes the shutdown hook exactly once", async () => {
+  const port = await freePort();
+  const token = "t".repeat(64);
+  const store = new StatusStore();
+  let calls = 0;
+  let resolveShutdown!: () => void;
+  const requested = new Promise<void>((resolveRequest) => (resolveShutdown = resolveRequest));
+  const ipc = new IpcServer(port, token, store, () => {
+    calls += 1;
+    resolveShutdown();
+  });
+  await ipc.start();
+  try {
+    const socket = createConnection({ host: "127.0.0.1", port });
+    const timer = setTimeout(() => socket.destroy(new Error("IPC test timeout")), 2_000);
+    // Token and command arrive together in a single write, before any snapshot.
+    socket.on("connect", () => socket.write(`${token}\nshutdown\n`));
+    socket.on("error", () => undefined);
+    await requested;
+    clearTimeout(timer);
+    socket.destroy();
+    assert.equal(calls, 1);
+  } finally {
+    await ipc.close();
+  }
+});
+
 test("unknown IPC commands drop the client without invoking the shutdown hook", async () => {
   const port = await freePort();
   const token = "t".repeat(64);

@@ -167,9 +167,11 @@ export class IpcServer {
         return;
       }
       socket.setTimeout(0);
-      let commands = "";
-      const onCommand = (commandChunk: Buffer): void => {
-        commands += commandChunk.toString("utf8");
+      // Any bytes buffered after the token's newline are command data that
+      // arrived in the same TCP segment; seed the command buffer with them so
+      // they are not dropped when the post-auth handler is installed.
+      let commands = input.slice(newline + 1);
+      const processCommands = (): void => {
         if (commands.length > 256) {
           socket.destroy();
           return;
@@ -184,10 +186,16 @@ export class IpcServer {
           socket.destroy();
         }
       };
+      const onCommand = (commandChunk: Buffer): void => {
+        commands += commandChunk.toString("utf8");
+        processCommands();
+      };
       socket.on("data", onCommand);
       socket.on("close", () => this.clients.delete(socket));
       this.clients.add(socket);
       socket.write(`${JSON.stringify(this.store.snapshot())}\n`);
+      // Process residual command bytes already buffered from the auth segment.
+      processCommands();
     };
     socket.on("data", onData);
   }
