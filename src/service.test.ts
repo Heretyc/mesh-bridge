@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import type { Config } from "./config.js";
 import { ReplyCorrelator, splitDiscordForMesh } from "./logic.js";
-import { BridgeService, resolveChannelPairs } from "./service.js";
+import { BridgeService, resolveChannelPairs, unresolvedMeshChannelNames } from "./service.js";
 import type { StatusStore, StatusSnapshot } from "./status.js";
 
 // service.version is read from package.json at runtime; tests derive it from the same manifest, never hardcode it.
@@ -77,6 +77,8 @@ interface Internals {
   handleDiscordReaction(reaction: unknown, user: unknown): Promise<void>;
   handleDiscordMessage(message: unknown): Promise<void>;
   handleMeshPacket(packet: unknown, session: unknown): void;
+  reconcileMeshResolution(resolved: Array<[number, PairInternals]>): void;
+  stopMeshResolutionAlerts(): void;
   telemetry: { close(): void };
   stateDir: string;
 }
@@ -687,16 +689,42 @@ test("shutdown completes well within the stop budget in the mocked environment",
   assert.equal(outcome, "completed");
 });
 
-// A drain that runs to its full timeout must NOT delay releasing Discord/mesh/IPC: shutdown() releases
-// those resources concurrently with the bounded drain wait, not strictly after it. If the change is
-// reverted to "await the full drain, THEN release", discord.destroy() is invoked only after the drain
-// timeout (was 15s), so the prompt-release assertion below fails. A hung worker keeps the drain from
-// finishing early, which is exactly what makes this test sensitive to the ordering.
-test("shutdown releases resources concurrently with a still-pending drain", async (t) => {
+// P4-002: work already accepted must be DELIVERED during shutdown, not dropped. The queues are drained
+// with the Discord and Mesh transports still alive, and those transports are torn down only AFTER the drain.
+test("shutdown delivers queued work through live transports before tearing them down", async (t) => {
+  const internals = newService(t);
+  const events: string[] = [];
+  const queue = internals.discordToMesh as unknown as {
+    start(worker: (item: unknown) => Promise<void>): void;
+    enqueue(item: unknown): boolean;
+  };
+  // A worker that delivers (records) then resolves models an in-flight send completing during the drain.
+  queue.start(async () => { events.push("delivered"); });
+  assert.equal(queue.enqueue({ id: "q1" }), true);
+
+  const svc = internals as unknown as {
+    discord: { destroy(): Promise<void> } | undefined;
+    mesh: { close(): Promise<void> } | undefined;
+    shutdown(drainMs?: number): Promise<void>;
+  };
+  svc.discord = { destroy: async () => { events.push("discord-destroyed"); } };
+  svc.mesh = { close: async () => { events.push("mesh-closed"); } };
+
+  await svc.shutdown();
+
+  // The queued item was delivered, and both transports were released strictly after that delivery.
+  assert.equal(events[0], "delivered", "queued work is delivered during shutdown");
+  assert.ok(events.indexOf("delivered") < events.indexOf("discord-destroyed"), "discord destroyed only after delivery");
+  assert.ok(events.indexOf("delivered") < events.indexOf("mesh-closed"), "mesh closed only after delivery");
+});
+
+// P4-002: a worker that never settles must not hang shutdown. The shared drain deadline still expires and
+// tears the transports down — but only AFTER the deadline, never concurrently with the still-pending drain.
+test("shutdown honours the shared drain deadline and tears transports down only after it", async (t) => {
   const internals = newService(t);
 
-  // A worker that never settles keeps one item in-flight, so drain() can never go idle and must run to
-  // its internal timeout. This is what an instantly-draining mocked queue cannot exercise.
+  // A worker that never settles keeps one item in-flight, so the drain can never go idle and must run to
+  // the shared deadline. This is what an instantly-draining mocked queue cannot exercise.
   const queue = internals.discordToMesh as unknown as {
     start(worker: (item: unknown) => Promise<void>): void;
     enqueue(item: unknown): boolean;
@@ -708,50 +736,26 @@ test("shutdown releases resources concurrently with a still-pending drain", asyn
     discord: { destroy(): Promise<void> } | undefined;
     mesh: { close(): Promise<void> } | undefined;
     ipc: { close(): Promise<void> };
-    shutdown(): Promise<void>;
+    shutdown(drainMs?: number): Promise<void>;
   };
 
-  let destroyedAt: number | undefined;
-  let meshClosedAt: number | undefined;
-  let ipcClosedAt: number | undefined;
-  let signalDestroyed: () => void;
-  const destroyed = new Promise<void>((resolve) => { signalDestroyed = resolve; });
-
-  const originalIpcClose = svc.ipc.close.bind(svc.ipc);
   const started = Date.now();
   const elapsed = (): number => Date.now() - started;
-
-  svc.discord = { destroy: async () => { destroyedAt = elapsed(); signalDestroyed(); } };
+  let destroyedAt: number | undefined;
+  let meshClosedAt: number | undefined;
+  const originalIpcClose = svc.ipc.close.bind(svc.ipc);
+  svc.discord = { destroy: async () => { destroyedAt = elapsed(); } };
   svc.mesh = { close: async () => { meshClosedAt = elapsed(); } };
-  svc.ipc.close = async () => { ipcClosedAt = elapsed(); await originalIpcClose(); };
+  svc.ipc.close = async () => { await originalIpcClose(); };
 
-  const settledAt = svc.shutdown().then(() => elapsed());
+  const drainMs = 200;
+  await svc.shutdown(drainMs);
 
-  // The release must happen promptly, WHILE the drain is still pending — so we can prove it without
-  // waiting out the full drain budget. Under the reverted (sequential) ordering the drain's timeout has
-  // to elapse first, so "destroyed" would lose this race.
-  const promptWindowMs = 1_500;
-  let promptGuard: ReturnType<typeof setTimeout> | undefined;
-  const outcome = await Promise.race([
-    destroyed.then(() => "released"),
-    new Promise<string>((resolve) => { promptGuard = setTimeout(() => resolve("waited-for-drain"), promptWindowMs); }),
-  ]);
-  clearTimeout(promptGuard);
-  assert.equal(outcome, "released", "discord.destroy() must run concurrently with the pending drain, not after it");
-  assert.ok(destroyedAt !== undefined && destroyedAt < promptWindowMs, `discord destroyed promptly (at ${String(destroyedAt)}ms)`);
-
-  // Second revert signal: shutdown itself settles near the 5s drain budget, well under the old 15s wait.
-  let settleGuard: ReturnType<typeof setTimeout> | undefined;
-  const settle = await Promise.race([
-    settledAt.then(() => "settled"),
-    new Promise<string>((resolve) => { settleGuard = setTimeout(() => resolve("too-slow"), 10_000); }),
-  ]);
-  clearTimeout(settleGuard);
-  assert.equal(settle, "settled", "shutdown() must settle at the drain budget, not after the old full-length drain");
-
-  // The mesh and IPC releases are part of the same concurrent batch, so they are prompt as well.
-  assert.ok(meshClosedAt !== undefined && meshClosedAt < promptWindowMs, `mesh closed promptly (at ${String(meshClosedAt)}ms)`);
-  assert.ok(ipcClosedAt !== undefined && ipcClosedAt < promptWindowMs, `ipc closed promptly (at ${String(ipcClosedAt)}ms)`);
+  // Transports stayed alive for the whole drain window (torn down only after the deadline expired)...
+  assert.ok(destroyedAt !== undefined && destroyedAt >= drainMs - 50, `discord destroyed after the drain window (at ${String(destroyedAt)}ms)`);
+  assert.ok(meshClosedAt !== undefined && meshClosedAt >= drainMs - 50, `mesh closed after the drain window (at ${String(meshClosedAt)}ms)`);
+  // ...yet shutdown still terminated within a bound, never hanging on the stuck worker.
+  assert.ok(elapsed() < drainMs + 5_000, `shutdown terminated within bound (at ${String(elapsed())}ms)`);
 });
 
 // ---------------------------------------------------------------------------
@@ -921,6 +925,36 @@ test("resolveChannelPairs: a name absent from the device leaves its pair pending
   assert.equal(resolved[0]![0], 2);
   assert.equal(resolved[0]![1].discordChannelId, CHANNEL_A);
   assert.ok(!resolved.some(([, pair]) => pair.meshtasticChannelName === "ghost"));
+  // Durability policy: the pending name is surfaced by name so startup can alert loudly on exactly it.
+  assert.deepEqual(unresolvedMeshChannelNames(pairs, resolved), ["ghost"]);
+});
+
+test("reconcileMeshResolution: a missing mesh channel keeps the service up and emits a loud, recoverable alert", (t) => {
+  const internals = newService(t, {
+    channels: [
+      { discordChannelId: CHANNEL_A, meshtasticChannelName: "alpha" },
+      { discordChannelId: CHANNEL_B, meshtasticChannelName: "ghost" }, // never present on the device.
+    ],
+  });
+  const alpha = pairOf(internals, CHANNEL_A);
+  const ghost = pairOf(internals, CHANNEL_B);
+
+  // "ghost" resolves to nothing; "alpha" does. The service must NOT throw — it degrades and alerts.
+  assert.doesNotThrow(() => internals.reconcileMeshResolution([[2, alpha]]));
+
+  const alerts = internals.status.snapshot().events.filter((event) => event.code === "MESH_CHANNEL_UNRESOLVED");
+  assert.equal(alerts.length, 1, "one loud error-level alert for the unresolved channel");
+  assert.equal(alerts[0]!.level, "error");
+  assert.ok(alerts[0]!.detail.includes("ghost"), "the alert names the failed channel");
+  // Service stays up: the working pair is untouched and the status snapshot still reports both configured rows.
+  assert.equal(internals.channelPairsStatus().length, 2);
+
+  // Recovery: once "ghost" resolves, a recovery event fires and the repeating alert stops (set drained).
+  internals.reconcileMeshResolution([[2, alpha], [3, ghost]]);
+  const recovered = internals.status.snapshot().events.filter((event) => event.code === "MESH_CHANNEL_RESOLVED");
+  assert.equal(recovered.length, 1);
+  assert.ok(recovered[0]!.detail.includes("ghost"));
+  internals.stopMeshResolutionAlerts(); // drop any live interval before the test exits.
 });
 
 test("resolveChannelPairs: two names resolving to distinct indexes both resolve with the correct index", () => {

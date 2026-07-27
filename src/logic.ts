@@ -387,16 +387,34 @@ export class BoundedQueue<T> {
     return this.items.length;
   }
 
-  public async drain(timeoutMs: number): Promise<boolean> {
+  /**
+   * Stop accepting new items and resolve true once the queue goes idle, or false when the bound elapses first.
+   * The bound is either this queue's own `timeoutMs` timer or, when a shared `deadline` signal is supplied, that
+   * signal firing — so several queues can drain concurrently under ONE shared wall-clock budget rather than each
+   * running its own independent timer. Draining never aborts in-flight work; it only waits it out under the bound.
+   */
+  public async drain(timeoutMs: number, deadline?: AbortSignal): Promise<boolean> {
     this.accepting = false;
     if (!this.pumping && this.items.length === 0) return true;
+    if (deadline?.aborted) return false;
     // When the idle path wins the race the timeout must be cleared: a ref'd setTimeout left pending
     // keeps the Node event loop alive, so the service never exits inside WinSW's stop budget.
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let onDeadline: (() => void) | undefined;
     return Promise.race([
       new Promise<boolean>((resolve) => this.idleWaiters.push(() => resolve(true))),
-      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); }),
-    ]).finally(() => clearTimeout(timer));
+      new Promise<boolean>((resolve) => {
+        if (deadline) {
+          onDeadline = () => resolve(false);
+          deadline.addEventListener("abort", onDeadline, { once: true });
+        } else {
+          timer = setTimeout(() => resolve(false), timeoutMs);
+        }
+      }),
+    ]).finally(() => {
+      clearTimeout(timer);
+      if (onDeadline) deadline?.removeEventListener("abort", onDeadline);
+    });
   }
 
   private async pump(): Promise<void> {

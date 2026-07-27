@@ -164,6 +164,16 @@ export function loadConfig(): Config {
   return parseConfig(process.env, source);
 }
 
+// Re-read only the channel pairs from config.jsonc on disk, without a process
+// restart. Used by the Discord channel-resolution retry loop so an operator can
+// correct a bad channel ID live. Reuses the full parse+validation path, so a
+// malformed edit throws here and the caller keeps retrying the last-known IDs.
+export function reloadChannelPairs(): ChannelPairConfig[] {
+  const configPath = resolve("config.jsonc");
+  const source = existsSync(configPath) ? readFileSync(configPath, "utf8") : undefined;
+  return parseConfig(process.env, source).channels;
+}
+
 // IPC-only load path: validates only what the TUI uses (IPC_TOKEN + ipcPort).
 // It reuses the same shared helpers as parseConfig, so presence, placeholder,
 // length, file, parse, root-type, and ipcPort-range messages are identical. It

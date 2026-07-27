@@ -72,3 +72,24 @@ Telemetry is fail-open. Filesystem errors in the telemetry path never stop relay
 traffic. The first failure marks `logDegraded`, emits one TUI warning and one
 stderr warning, and drops telemetry records silently until a later write
 succeeds. On recovery, the TUI and stderr receive one recovery notice.
+
+## Stable Event Codes
+
+Stable codes appear in `eventName` and as `body.stringValue`. ERROR codes use
+`severityNumber` 17; INFO codes use 9. Attributes listed below map to
+`attributes[]` KeyValue entries.
+
+| Code | Severity | Condition | Key attributes |
+| ---- | -------- | --------- | -------------- |
+| `SERVICE_STARTED` | info | Bridge started; IPC listener bound | `ipcPort` |
+| `SERVICE_STOPPING` | info | Graceful shutdown begun | — |
+| `SERVICE_FATAL` | error | Unrecoverable error; process will exit | `reason` |
+| `DISCORD_CONNECTED` | info | Discord client authenticated and channels wired | `resolved`, `broken` |
+| `DISCORD_CONNECT_FAILED` | error | Discord client lost or failed to connect; will retry | `reason`, `retryMs` |
+| `DISCORD_CHANNEL_UNRESOLVED` | error | A configured Discord channel ID failed to resolve (non-fatal); repeats every 2 min while still broken | `discordChannelId`, `reason` |
+| `DISCORD_CHANNEL_RESOLVED` | info | A previously unresolvable Discord channel now resolves | `discordChannelId` |
+| `DISCORD_CONFIG_RELOAD_FAILED` | error | Failed to re-read `config.jsonc` during Discord channel retry | `discordChannelId`, `reason` |
+| `MESHTASTIC_CONNECTED` | info | Device connected and channel list read | `channels` (resolved indices) |
+| `MESHTASTIC_CONNECT_FAILED` | error | Device connection lost or failed; will retry | `reason`, `retryMs` |
+| `MESH_CHANNEL_UNRESOLVED` | error | One or more configured Meshtastic channel names absent from the device; repeats every 2 min while any are pending | `meshtasticChannelNames`, `repeat` (on repeats) |
+| `MESH_CHANNEL_RESOLVED` | info | A previously pending Meshtastic channel name resolved on device connect | `meshtasticChannelName` |

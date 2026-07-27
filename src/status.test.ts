@@ -121,6 +121,37 @@ test("unknown IPC commands drop the client without invoking the shutdown hook", 
   }
 });
 
+test("close() promptly destroys a socket stuck mid-authentication instead of waiting out its deadline", async () => {
+  const port = await freePort();
+  const token = "t".repeat(64);
+  const store = new StatusStore();
+  const ipc = new IpcServer(port, token, store);
+  await ipc.start();
+  try {
+    // A client that writes a partial token with no newline never authenticates, so it is never a tracked
+    // subscriber — before the fix close() left the server waiting on it until the 5s auth deadline fired.
+    const socket = createConnection({ host: "127.0.0.1", port });
+    await new Promise<void>((resolve, reject) => {
+      socket.on("connect", () => {
+        socket.write("partial-token-without-a-newline");
+        resolve();
+      });
+      socket.on("error", reject);
+    });
+    // Yield so the server's connection handler has accepted and tracked the socket before we close.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const started = Date.now();
+    await ipc.close();
+    const elapsed = Date.now() - started;
+    // Far under the 5s absolute auth deadline: close() destroyed the pre-auth socket up front, not waited.
+    assert.ok(elapsed < 1_000, `close() returned promptly (${elapsed}ms)`);
+    socket.destroy();
+  } finally {
+    await ipc.close();
+  }
+});
+
 test("local IPC authenticates and exposes only sanitized status", async () => {
   const port = await freePort();
   const token = "t".repeat(64);

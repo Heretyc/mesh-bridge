@@ -145,6 +145,67 @@ test("malformed and truncated journal lines are skipped while valid entries load
   assert.equal(replies.discordTargetFor(302, baseNow + 2), "survivor-discord");
 });
 
+test("degraded startup read never overwrites the recoverable on-disk journal", (t) => {
+  const dir = tempState(t);
+  const journalDir = join(dir, "journal");
+  mkdirSync(journalDir, { recursive: true });
+  const file = join(journalDir, `${channelA}.reply-mapping.jsonl`);
+  const original = [
+    JSON.stringify({ dir: "meshRootByDiscordId", k: "recoverable-root", v: 601, at: baseNow }),
+    JSON.stringify({ dir: "discordIdByMeshId", k: 601, v: "recoverable-root", at: baseNow }),
+    "",
+  ].join("\n");
+  writeFileSync(file, original);
+
+  const stderrWrites: string[] = [];
+  const stderr = process.stderr as NodeJS.WriteStream & { write(chunk: string): boolean };
+  const originalWrite = stderr.write.bind(stderr);
+  stderr.write = ((chunk: string) => {
+    stderrWrites.push(chunk);
+    return true;
+  }) as typeof stderr.write;
+  t.after(() => {
+    stderr.write = originalWrite as typeof stderr.write;
+  });
+
+  // Force a non-ENOENT read failure at construction so replay never populates the maps.
+  let replaceCalls = 0;
+  const journal = new ChannelJournal(channelA, {
+    now: () => baseNow,
+    read: () => { throw Object.assign(new Error("simulated read failure"), { code: "EIO" }); },
+    replace: (path, data) => { replaceCalls += 1; writeFileSync(path, data); },
+    onDegraded: () => {},
+  });
+
+  journal.compact(baseNow);
+  journal.close();
+
+  // Compaction must have stayed a no-op: no rewrite issued, file byte-identical.
+  assert.equal(replaceCalls, 0);
+  assert.equal(readFileSync(file, "utf8"), original);
+  assert.ok(stderrWrites.some((chunk) => chunk.includes("skipping reply mapping journal compaction")));
+
+  // The still-intact file recovers cleanly on a subsequent healthy restart.
+  const after = correlator(new ChannelJournal(channelA, { now: () => baseNow + 1 }));
+  assert.equal(after.discordTargetFor(601, baseNow + 1), "recoverable-root");
+  assert.equal(after.meshRootFor("recoverable-root", baseNow + 1), 601);
+});
+
+test("clean replay still compacts on close and timer paths", (t) => {
+  tempState(t);
+  const journal = new ChannelJournal(channelA, { now: () => baseNow });
+  const replies = correlator(journal);
+  const old = baseNow - JOURNAL_TTL_MS - 1;
+  replies.recordInbound(801, "expired-on-close", old);
+  replies.recordInbound(802, "live-on-close", baseNow);
+
+  assert.equal(readFileSync(journal.file, "utf8").includes("expired-on-close"), true);
+  journal.close();
+  const compacted = readFileSync(journal.file, "utf8");
+  assert.equal(compacted.includes("expired-on-close"), false);
+  assert.equal(compacted.includes("live-on-close"), true);
+});
+
 test("validated channel ids use separate files and isolated mappings", (t) => {
   tempState(t);
   const first = new ChannelJournal(channelA, { now: () => baseNow });

@@ -55,18 +55,70 @@ USB discovery probes `/dev/ttyUSB*` and `/dev/ttyACM*`. The service user must be
 
 ## macOS
 
-Install writes a launchd LaunchAgent to:
+Install writes a launchd LaunchDaemon to the system domain at:
 
 ```text
-~/Library/LaunchAgents/dev.meshbridge.plist
+/Library/LaunchDaemons/dev.meshbridge.plist
 ```
 
-Autostart uses `RunAtLoad` and `KeepAlive`. `servicectl` installs with `launchctl bootstrap gui/<uid> <plist>`, stops or uninstalls with `launchctl bootout gui/<uid>/dev.meshbridge`, checks status with `launchctl print gui/<uid>/dev.meshbridge`, and starts or restarts with `launchctl kickstart -k gui/<uid>/dev.meshbridge`.
+It is a system-domain LaunchDaemon, not a per-user GUI LaunchAgent, so the bridge survives logout and reboot without a login session. All service verbs (`install`, `start`, `stop`, `restart`, `uninstall`) mutate the system domain and therefore require root; `servicectl` fails closed with an explicit "must run as root — re-run with sudo" error when the effective uid is not 0. `status` and `attach` do not need root.
 
-The service is a LaunchAgent, not a LaunchDaemon, because a daemon would run as root and could not own `~/Library/Logs/Mesh Bridge`.
+The daemon drops privileges to a dedicated unprivileged account. Provision it once before installing (a role account with no login shell), and its matching group:
 
-Install also writes `.command` launchers for attach and restart under `~/Applications`.
+```bash
+sudo sysadminctl -addUser _meshbridge -fullName "Mesh Bridge" -shell /usr/bin/false -home /var/empty
+sudo dseditgroup -o create _meshbridge
+```
 
-Logs live under `~/Library/Logs/Mesh Bridge`. Reply journals live under `~/Library/Application Support/Mesh Bridge/journal`. With `MESH_BRIDGE_STATE_DIR`, logs use `<root>/Logs` and journals use `<root>/journal`.
+The plist sets `UserName`/`GroupName` to `_meshbridge` and pins `MESH_BRIDGE_STATE_DIR=/Library/Application Support/Mesh Bridge` so writable state and logs live in a system directory that account owns rather than any user's home. The sudo install creates that directory (and its `Logs`) so the account can write there.
+
+Autostart uses `RunAtLoad` and `KeepAlive`. Verb semantics are distinct:
+
+- `install`: `launchctl bootstrap system /Library/LaunchDaemons/dev.meshbridge.plist`.
+- `start`: `bootstrap` the plist when the label is unloaded, otherwise `launchctl kickstart system/dev.meshbridge`.
+- `stop`: `launchctl bootout system/dev.meshbridge` — unloads the job only; it deletes no artifacts, so a later `start` re-bootstraps it.
+- `restart`: `launchctl kickstart -k system/dev.meshbridge` when loaded, otherwise `bootstrap`.
+- `uninstall`: `bootout`, then remove the plist and both `.command` launchers.
+- `status`: `launchctl print system/dev.meshbridge`.
+
+Install also writes `.command` launchers for attach and restart under the invoking user's `~/Applications`; `uninstall` removes them.
+
+Logs live under `/Library/Application Support/Mesh Bridge/Logs`. Reply journals live under `/Library/Application Support/Mesh Bridge/journal`. Setting `MESH_BRIDGE_STATE_DIR` overrides the root, with logs at `<root>/Logs` and journals at `<root>/journal`.
 
 USB serial devices commonly appear twice on macOS: `/dev/tty.*` and `/dev/cu.*`. Mesh Bridge opens only `/dev/cu.*`; opening the `tty.*` twin can block waiting for carrier detect.
+
+## Graceful Shutdown
+
+Shutdown runs in three ordered phases regardless of platform:
+
+1. **Ingress stop** — the `stopping` signal fires. The Discord and Meshtastic
+   reconnect loops unblock and return without tearing down their live transports,
+   leaving Discord and Meshtastic online for the drain that follows.
+
+2. **Drain** — both outbound queues (Discord→Mesh and Mesh→Discord) drain
+   concurrently under one shared 15-second wall-clock deadline (`SHUTDOWN_DRAIN_MS`).
+   The live transports remain open during this window so accepted work is actually
+   delivered. A single `AbortController` fires after 15 seconds; both queues race
+   against that shared signal rather than each running an independent timer. If the
+   deadline elapses first, remaining queued work is abandoned and shutdown continues.
+   After a fatal error the transport signal is already aborted, so workers bail and
+   the drain returns immediately without waiting.
+
+3. **Abort and close** — the `abort` signal fires, cancelling any in-flight sends.
+   Discord client (`client.destroy()`), Meshtastic session (`session.close()`), and
+   IPC server are closed in parallel.
+
+The 15-second drain budget is chosen to fit within WinSW's 20-second `stoptimeout`
+with headroom for the transport teardown that follows.
+
+### IPC server shutdown
+
+`IpcServer.close()` destroys every accepted socket — including any still in the
+middle of authentication — before waiting for the server to close. This guarantees
+`server.close()` is never held open by a pre-auth connection that never completes
+the handshake.
+
+Authentication uses an absolute 5-second deadline (`IPC_AUTH_TIMEOUT_MS`) set at
+socket accept time, not a resettable inactivity timeout. A client that dribbles
+token bytes cannot extend this bound, so a pre-auth socket can never outlast the
+shutdown drain budget.

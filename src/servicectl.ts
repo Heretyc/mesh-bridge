@@ -29,6 +29,12 @@ export interface ServiceCtlDeps {
 const verbs = new Set<Verb>(["install", "start", "stop", "status", "uninstall", "attach", "restart"]);
 const serviceName = "mesh-bridge.service";
 const launchLabel = "dev.meshbridge";
+// macOS runs as a system-domain LaunchDaemon (survives logout/reboot), not a
+// per-user GUI agent. It drops privileges to this dedicated account and writes
+// state under a system directory that account owns.
+const darwinDomain = "system";
+const darwinTarget = `${darwinDomain}/${launchLabel}`;
+const darwinAccount = "_meshbridge";
 
 function defaultDeps(): ServiceCtlDeps {
   return {
@@ -143,9 +149,15 @@ function linux(deps: ServiceCtlDeps, verb: Verb): number {
 function darwinPaths(deps: ServiceCtlDeps) {
   const home = deps.homedir();
   const cwd = deps.cwd();
+  // System-domain daemon: plist and writable state live outside any user home
+  // so the job survives logout and its unprivileged account can own them.
+  const stateRoot = posix.join("/", "Library", "Application Support", "Mesh Bridge");
+  const logDir = posix.join(stateRoot, "Logs");
   return {
-    plist: posix.join(home, "Library", "LaunchAgents", `${launchLabel}.plist`),
-    logDir: posix.join(home, "Library", "Logs", "Mesh Bridge"),
+    plist: posix.join("/", "Library", "LaunchDaemons", `${launchLabel}.plist`),
+    stateRoot,
+    logDir,
+    // Interactive helpers stay in the invoking user's ~/Applications.
     attach: posix.join(home, "Applications", "Mesh Bridge Attach.command"),
     restart: posix.join(home, "Applications", "Mesh Bridge Restart.command"),
     service: posix.join(cwd, "dist", "service.js"),
@@ -153,6 +165,18 @@ function darwinPaths(deps: ServiceCtlDeps) {
     ctl: posix.join(cwd, "dist", "servicectl.js"),
     cwd,
   };
+}
+
+// Loading/booting a system-domain daemon requires root. Fail closed with an
+// explicit, actionable message instead of surfacing a raw launchctl error.
+function darwinRequireRoot(deps: ServiceCtlDeps, verb: Verb): boolean {
+  if (deps.uid() === 0) return true;
+  deps.stderr(`service:${verb} manages the system LaunchDaemon ${launchLabel} and must run as root. Re-run with sudo.\n`);
+  return false;
+}
+
+function darwinLoaded(deps: ServiceCtlDeps): boolean {
+  return code(run(deps, "launchctl", ["print", darwinTarget], "pipe")) === 0;
 }
 
 async function darwinInstall(deps: ServiceCtlDeps): Promise<number> {
@@ -166,17 +190,30 @@ async function darwinInstall(deps: ServiceCtlDeps): Promise<number> {
     workingDirectory: p.cwd,
     stdoutPath: posix.join(p.logDir, "service.out.log"),
     stderrPath: posix.join(p.logDir, "service.err.log"),
+    userName: darwinAccount,
+    stateDir: p.stateRoot,
   }));
   deps.mkdirSync(posix.dirname(p.attach), { recursive: true });
   deps.writeFileSync(p.attach, commandFile({ nodePath: deps.execPath, scriptPath: p.tui }));
   deps.writeFileSync(p.restart, commandFile({ nodePath: deps.execPath, scriptPath: p.ctl, args: ["restart"] }));
   await deps.chmod(p.attach, 0o755);
   await deps.chmod(p.restart, 0o755);
-  return code(run(deps, "launchctl", ["bootstrap", `gui/${deps.uid()}`, p.plist]));
+  return code(run(deps, "launchctl", ["bootstrap", darwinDomain, p.plist]));
+}
+
+function darwinUninstall(deps: ServiceCtlDeps): number {
+  const p = darwinPaths(deps);
+  // Unload first (best effort — it may already be unloaded), then delete every
+  // generated artifact: the plist and both .command launchers.
+  run(deps, "launchctl", ["bootout", darwinTarget]);
+  deps.rmSync(p.plist, { force: true });
+  deps.rmSync(p.attach, { force: true });
+  deps.rmSync(p.restart, { force: true });
+  return 0;
 }
 
 function darwinStatus(deps: ServiceCtlDeps): number {
-  const result = run(deps, "launchctl", ["print", `gui/${deps.uid()}/${launchLabel}`], "pipe");
+  const result = run(deps, "launchctl", ["print", darwinTarget], "pipe");
   const installed = deps.existsSync(darwinPaths(deps).plist);
   const running = code(result) === 0;
   deps.stdout(`darwin installed=${installed} running=${running} autostart=${installed}\n`);
@@ -185,10 +222,22 @@ function darwinStatus(deps: ServiceCtlDeps): number {
 
 async function darwin(deps: ServiceCtlDeps, verb: Verb): Promise<number> {
   if (verb === "attach") return code(run(deps, deps.execPath, [join("dist", "tui.js")]));
-  if (verb === "install") return darwinInstall(deps);
   if (verb === "status") return darwinStatus(deps);
-  if (verb === "uninstall" || verb === "stop") return code(run(deps, "launchctl", ["bootout", `gui/${deps.uid()}/${launchLabel}`]));
-  return code(run(deps, "launchctl", ["kickstart", "-k", `gui/${deps.uid()}/${launchLabel}`]));
+  if (!darwinRequireRoot(deps, verb)) return 1;
+  if (verb === "install") return darwinInstall(deps);
+  if (verb === "uninstall") return darwinUninstall(deps);
+  // stop = unload the job WITHOUT deleting any artifacts, so a later start can
+  // re-bootstrap it. (Previously stop and uninstall both booted out, and start
+  // always kickstarted — so start after stop failed on an unloaded label.)
+  if (verb === "stop") return code(run(deps, "launchctl", ["bootout", darwinTarget]));
+  // start = bootstrap when the label is unloaded, else kickstart the loaded job.
+  if (verb === "start") {
+    if (darwinLoaded(deps)) return code(run(deps, "launchctl", ["kickstart", darwinTarget]));
+    return code(run(deps, "launchctl", ["bootstrap", darwinDomain, darwinPaths(deps).plist]));
+  }
+  // restart = kickstart -k (stop+start in one) when loaded, else bootstrap.
+  if (darwinLoaded(deps)) return code(run(deps, "launchctl", ["kickstart", "-k", darwinTarget]));
+  return code(run(deps, "launchctl", ["bootstrap", darwinDomain, darwinPaths(deps).plist]));
 }
 
 export async function runServiceCtl(argv: string[], platform: NodeJS.Platform = process.platform, deps: ServiceCtlDeps = defaultDeps()): Promise<number> {

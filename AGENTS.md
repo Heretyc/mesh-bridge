@@ -65,11 +65,32 @@ read it first and treat it as the canonical hub.
   working tree or any memory-tool use.
 - `docs/spec/mapping-journal.md`: read before changing reply correlation
   persistence, journal format, or retention/compaction behavior.
-- `docs/spec/bridge-config.md`: read before changing configuration loading,
-  validation, channel pairing, or config.jsonc. Do not read for unrelated
-  feature work.
+- `docs/spec/bridge-config.md`: RAG retrieval map for all bridge-config topics;
+  read first before any change to configuration loading, validation, channel
+  pairing, config.jsonc, or graceful-degradation behavior; then follow the map
+  to the specific leaf. Do not read for unrelated feature work.
+- `docs/spec/bridge-config/config-schema.md`: read when touching config.jsonc
+  structure, TypeScript Config/ChannelPairConfig types, or jsonc-parser rules.
+- `docs/spec/bridge-config/tuning-properties.md`: read when changing or
+  verifying defaults/ranges for ipcPort, queueLimit, ackRetries, sendIntervalMs,
+  configTimeoutMs, or dedupTtlMs.
+- `docs/spec/bridge-config/channel-pairs.md`: read when changing channel pairing
+  rules, snowflake format, or meshtasticChannelName byte limit.
+- `docs/spec/bridge-config/validation.md`: read when implementing, auditing, or
+  debugging any parseConfig validation step or exact error message.
+- `docs/spec/bridge-config/legacy-env-cutover.md`: read when DISCORD_CHANNEL_ID
+  or MESHTASTIC_CHANNEL_NAME appears in any startup or env context.
+- `docs/spec/bridge-config/ipc-load-path.md`: read when working on loadIpcConfig
+  or the TUI-only startup path (token+port without full bridge).
+- `docs/spec/bridge-config/routing-isolation.md`: read when working on message
+  routing, pair isolation, graceful degradation, alerting codes, or dedup key
+  namespacing.
+- `docs/spec/bridge-config/operational.md`: read when working on ChannelJournal,
+  ReplyCorrelator, TUI status format, version telemetry, or operator deployment
+  notes.
 - `docs/spec/cross-platform-service.md`: read before changing service
-  install/autostart, `servicectl`, platform builders, or serial discovery.
+  install/autostart, `servicectl`, platform builders, serial discovery, or
+  shutdown sequencing.
 - `docs/spec/docker.md`: read before changing Dockerfile or Compose service
   packaging.
 - `docs/spec/dev-loop/_INDEX.md`: read when you need to choose which dev-loop
@@ -91,7 +112,7 @@ read it first and treat it as the canonical hub.
   future agents/maintainers must follow. Do not read for one-off task notes,
   changelogs, or agent-state markdown unless they contain reusable rules.
 - `docs/spec/otel-logging.md`: read before changing on-disk log format,
-  redaction, retention/prune, or state-dir resolution.
+  redaction, retention/prune, state-dir resolution, or stable event codes.
 - `docs/spec/safety-scope/00-scope-and-cascade.md`: read when determining
   whether the clarifying-question cascade applies to the current turn or
   whether the session is automated.
@@ -106,6 +127,12 @@ read it first and treat it as the canonical hub.
 
 ## Always Enforce
 
+- **Durability policy (user-ratified).** Service durability and uptime take
+  precedence over hard fail-closed behavior. Partial and graceful degradation
+  with loud, repeating alerts is standard operating procedure; full startup
+  abort or shutdown is reserved for genuinely unrecoverable states (e.g.
+  invalid credentials). Full spec: `docs/spec/bridge-config/routing-isolation.md`
+  (graceful degradation & loud alerting).
 - Before any file edit or git write action, inspect
   `git status --short --branch`.
 - No external memory writes ever, no exceptions — no outside-repo persistence of
