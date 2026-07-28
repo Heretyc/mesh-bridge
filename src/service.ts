@@ -1030,7 +1030,6 @@ export class BridgeService {
     // at once rather than waiting the full budget.
     const deadline = new AbortController();
     const deadlineTimer = setTimeout(() => deadline.abort(), drainMs);
-    deadlineTimer.unref();
     try {
       await Promise.all([
         this.discordToMesh.drain(drainMs, deadline.signal),

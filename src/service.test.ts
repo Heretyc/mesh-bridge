@@ -739,23 +739,40 @@ test("shutdown honours the shared drain deadline and tears transports down only 
     shutdown(drainMs?: number): Promise<void>;
   };
 
-  const started = Date.now();
-  const elapsed = (): number => Date.now() - started;
-  let destroyedAt: number | undefined;
-  let meshClosedAt: number | undefined;
+  const events: string[] = [];
   const originalIpcClose = svc.ipc.close.bind(svc.ipc);
-  svc.discord = { destroy: async () => { destroyedAt = elapsed(); } };
-  svc.mesh = { close: async () => { meshClosedAt = elapsed(); } };
+  svc.discord = { destroy: async () => { events.push("discord-destroyed"); } };
+  svc.mesh = { close: async () => { events.push("mesh-closed"); } };
   svc.ipc.close = async () => { await originalIpcClose(); };
 
   const drainMs = 200;
-  await svc.shutdown(drainMs);
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  let deadline: (() => void) | undefined;
+  let scheduledMs: number | undefined;
+  let cleared = false;
+  globalThis.setTimeout = ((handler: Parameters<typeof setTimeout>[0], timeout?: number) => {
+    scheduledMs = timeout;
+    deadline = () => { if (typeof handler === "function") handler(); };
+    return {} as NodeJS.Timeout;
+  }) as unknown as typeof setTimeout;
+  globalThis.clearTimeout = (() => { cleared = true; }) as typeof clearTimeout;
+  try {
+    const shutdown = svc.shutdown(drainMs);
+    await Promise.resolve();
+    assert.equal(scheduledMs, drainMs);
+    assert.deepEqual(events, [], "transports stay live until the shared deadline fires");
 
-  // Transports stayed alive for the whole drain window (torn down only after the deadline expired)...
-  assert.ok(destroyedAt !== undefined && destroyedAt >= drainMs - 50, `discord destroyed after the drain window (at ${String(destroyedAt)}ms)`);
-  assert.ok(meshClosedAt !== undefined && meshClosedAt >= drainMs - 50, `mesh closed after the drain window (at ${String(meshClosedAt)}ms)`);
-  // ...yet shutdown still terminated within a bound, never hanging on the stuck worker.
-  assert.ok(elapsed() < drainMs + 5_000, `shutdown terminated within bound (at ${String(elapsed())}ms)`);
+    assert.ok(deadline);
+    deadline();
+    await shutdown;
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
+  }
+
+  assert.equal(cleared, true);
+  assert.deepEqual(events, ["discord-destroyed", "mesh-closed"]);
 });
 
 // ---------------------------------------------------------------------------

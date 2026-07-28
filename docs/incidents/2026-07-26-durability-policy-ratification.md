@@ -2,12 +2,10 @@
 
 Date: 2026-07-26
 
-This note is the auditable record backing the "user-ratified" label on the
-**Durability policy** directive in `AGENTS.md` ("Always Enforce"). It records the
-owner authorization verbatim, when and how it was given, and exactly which
-durable changes it authorizes. It follows the ratification-record precedent set
-by `docs/incidents/2026-07-24-local-landing.md`, which quotes owner authorization
-verbatim rather than asserting ratification without a citation.
+This note is the background record for the **Durability policy** directive in
+`AGENTS.md` ("Always Enforce"). It records the durability ruling, when and how it
+was given, and exactly which durable changes it covers. It follows the
+record precedent set by `docs/incidents/2026-07-24-local-landing.md`.
 
 ## Authorization
 
@@ -29,7 +27,7 @@ not inferred by an agent.
 
 This ruling authorizes and constrains the following durable changes:
 
-1. `AGENTS.md` "Always Enforce" — the **Durability policy (user-ratified)**
+1. `AGENTS.md` "Always Enforce" — the **Durability policy**
    bullet: durability/uptime take precedence over hard fail-close; partial and
    graceful degradation with loud, repeating alerts is SOP; full startup abort or
    shutdown is reserved for genuinely unrecoverable states (e.g. invalid

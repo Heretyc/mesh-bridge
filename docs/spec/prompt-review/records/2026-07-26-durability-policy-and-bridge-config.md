@@ -4,7 +4,7 @@ These records satisfy the Directive/SOP Review Gate
 (`docs/spec/dev-loop/git-collaboration.md`) and
 `docs/spec/prompt-review/eight-perspective-review.md` for the durable
 directive/SOP/spec content introduced on branch `fix/s1-batch1-audit`
-(PR #58): the new `AGENTS.md` "Durability policy" directive and the new
+(PR #59): the new `AGENTS.md` "Durability policy" directive and the new
 `docs/spec/bridge-config.md` retrieval map plus its leaf specs. Records follow
 the template in `eight-perspective-review.md` exactly. Findings are honest: the
 first review surfaced a real concern (the unbacked "user-ratified" label), which

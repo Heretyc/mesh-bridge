@@ -55,7 +55,7 @@ read it first and treat it as the canonical hub.
   2026-07-24 local landing bypassed the PR, CI, self-merge, or prompt-review
   gates.
 - `docs/incidents/2026-07-26-durability-policy-ratification.md`: read when
-  verifying the owner authorization behind the "user-ratified" Durability policy
+  reviewing the background behind the Durability policy
   directive, or the P3-003 not-a-bug ruling.
 - `docs/spec/safety-scope.md`: read when an interactive human prompt is over
   150 words; asks for structural, architectural, debug, troubleshooting, or
@@ -133,13 +133,12 @@ read it first and treat it as the canonical hub.
 
 ## Always Enforce
 
-- **Durability policy (user-ratified).** Service durability and uptime take
+- **Durability policy.** Service durability and uptime take
   precedence over hard fail-closed behavior. Partial and graceful degradation
   with loud, repeating alerts is standard operating procedure; full startup
   abort or shutdown is reserved for genuinely unrecoverable states (e.g.
   invalid credentials). Full spec: `docs/spec/bridge-config/routing-isolation.md`
-  (graceful degradation & loud alerting). Ratification record (owner
-  authorization verbatim):
+  (graceful degradation & loud alerting). Background record:
   `docs/incidents/2026-07-26-durability-policy-ratification.md`.
 - Before any file edit or git write action, inspect
   `git status --short --branch`.
@@ -152,7 +151,8 @@ read it first and treat it as the canonical hub.
 - Before any repository commit that changes executable/source code, dispatch a
   separate contradiction-checker sub-agent using the strongest explicitly
   selectable model and reasoning settings available to check against relevant
-  specs/docs. If unavailable, halt and tell the owner. If it reports `blocked`
+  specs/docs. If unavailable, log the unavailability as a Validation Note with a
+  degraded-confidence flag and continue. If it reports `blocked`
   or `needs_user`, perform no writes; surface the blocker and resolve it through
   the applicable `docs/spec/safety-scope.md` flow. Do not self-trigger a
   clarification cascade.

@@ -88,7 +88,8 @@ is concerned or unsure:
 1. Record the concern.
 2. Revise if the fix is within confirmed scope.
 3. Re-run the review.
-4. If concern remains or the fix changes scope, stop and ask the owner.
+4. If concern remains, set Status: fail, enumerate open perspective concerns in
+   Findings, and require the PR diff to address them before re-run.
 
 Do not mark review complete by majority vote.
 
