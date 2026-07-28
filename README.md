@@ -75,7 +75,7 @@ Windows shells the existing audited PowerShell scripts. The installer downloads 
 
 Linux installs a systemd user unit at `~/.config/systemd/user/mesh-bridge.service`, enables it with `systemctl --user enable --now mesh-bridge.service`, and enables linger with `loginctl enable-linger "$USER"` so it survives logout and reboot. Install also creates attach and restart `.desktop` launchers under `~/.local/share/applications`.
 
-macOS installs a launchd LaunchAgent at `~/Library/LaunchAgents/dev.meshbridge.plist` with `RunAtLoad` and `KeepAlive`. Install also creates attach and restart `.command` launchers under `~/Applications`.
+macOS installs a system-domain launchd LaunchDaemon at `/Library/LaunchDaemons/dev.meshbridge.plist` with `RunAtLoad` and `KeepAlive`, so it survives logout and reboot. Service verbs mutate the system domain and must run with `sudo`; the daemon drops privileges to a dedicated `_meshbridge` account and keeps state under `/Library/Application Support/Mesh Bridge`. Install also creates attach and restart `.command` launchers under `~/Applications`. See `docs/spec/cross-platform-service.md` for account provisioning.
 
 Uninstall removes the OS service registration but deliberately retains `.env`, logs, and local state. More detail is in `docs/spec/cross-platform-service.md`.
 

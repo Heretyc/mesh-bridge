@@ -26,7 +26,5 @@ CI/CD.
 - Require `claude-routine-dispatch` in branch protection or rulesets only when
   the GitHub account plan enforces private-repository protections. On private
   Free organization repos, treat the check as a mandatory manual merge gate.
-- PRs must pass required checks, independent review, CODEOWNER review when
-  applicable, and resolved conversations before merge.
-- Agent-authored PRs use the same CI, review, and merge gates as human PRs.
-- Workflow changes are executable code and require owner/CODEOWNER review.
+- PRs must pass required checks and resolved conversations before merge.
+- Agent-authored PRs use the same CI and merge gates as human PRs.

@@ -18,6 +18,7 @@ export type JournalRecord =
 
 type Writer = (path: string, record: unknown) => void;
 type Replacer = (path: string, data: string | Buffer) => void;
+type Reader = (path: string) => unknown[];
 
 export interface JournalOptions {
   now?: () => number;
@@ -25,6 +26,7 @@ export interface JournalOptions {
   onRecovered?: () => void;
   append?: Writer;
   replace?: Replacer;
+  read?: Reader;
 }
 
 function isRecord(record: unknown): record is JournalRecord {
@@ -108,6 +110,7 @@ export class ChannelJournal {
   private readonly timer: DailyTask;
   private readonly now: () => number;
   private readonly writer: JournalWriter;
+  private replayed = false;
 
   public constructor(channelId: string, opts: JournalOptions = {}) {
     if (!CHANNEL_ID.test(channelId)) throw new Error("Discord channel id must be a validated snowflake before journal use");
@@ -117,19 +120,28 @@ export class ChannelJournal {
     this.meshRootByDiscordId = new JournaledTtlMap<string, number>(JOURNAL_TTL_MS, JOURNAL_LIMIT, "meshRootByDiscordId", this.writer, this.now);
     this.discordIdByMeshId = new JournaledTtlMap<number, string>(JOURNAL_TTL_MS, JOURNAL_LIMIT, "discordIdByMeshId", this.writer, this.now);
 
-    let replayed = false;
+    const read = opts.read ?? readJsonlTolerant;
     try {
       ensureDir(journalDir());
-      for (const record of readJsonlTolerant<unknown>(this.file)) this.replay(record);
-      replayed = true;
+      for (const record of read(this.file)) this.replay(record);
+      this.replayed = true;
     } catch (error) {
       this.writer.failOpen(error);
     }
-    if (replayed) this.compact();
+    if (this.replayed) this.compact();
     this.timer = scheduleDailyLocal(JOURNAL_COMPACT_HOUR, () => this.compact(), { now: this.now, onError: (error) => this.writer.failOpen(error) });
   }
 
   public compact(now = this.now()): void {
+    // Data-loss guard: never rewrite the on-disk journal until at least one clean
+    // replay has populated the in-memory maps. A failed (non-ENOENT) startup read
+    // leaves the maps empty but the file still recoverable; compacting here would
+    // overwrite that recoverable content with near-empty data. Appends continue
+    // fail-open, but compaction stays a no-op while the load is degraded.
+    if (!this.replayed) {
+      process.stderr.write("[Mesh Bridge] warning: skipping reply mapping journal compaction; on-disk journal was never cleanly replayed (preserving recoverable data)\n");
+      return;
+    }
     const records: JournalRecord[] = [
       ...this.meshRootByDiscordId.liveEntries(now).map(([k, v, at]) => ({ dir: "meshRootByDiscordId" as const, k, v, at })),
       ...this.discordIdByMeshId.liveEntries(now).map(([k, v, at]) => ({ dir: "discordIdByMeshId" as const, k, v, at })),

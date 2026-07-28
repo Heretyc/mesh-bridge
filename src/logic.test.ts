@@ -402,3 +402,33 @@ test("BoundedQueue.drain still honours its timeout when the queue never drains",
   assert.equal(await queue.drain(20), false);
   releaseWorker(); // let the hung worker settle so nothing lingers after the test
 });
+
+test("BoundedQueue.drain bounds two queues under one shared deadline and delivers before it fires", async () => {
+  // A shared deadline lets several queues drain under ONE wall-clock budget (the shutdown drain contract).
+  const deadline = new AbortController();
+  const delivered: number[] = [];
+  const live = new BoundedQueue<number>(4, () => undefined);
+  const hung = new BoundedQueue<number>(4, () => undefined);
+  live.start(async (item) => { delivered.push(item); });
+  hung.start(() => new Promise<void>(() => undefined)); // never settles
+  assert.equal(live.enqueue(1), true);
+  assert.equal(hung.enqueue(2), true);
+
+  const timer = setTimeout(() => deadline.abort(), 50);
+  const [liveDone, hungDone] = await Promise.all([
+    live.drain(60_000, deadline.signal),
+    hung.drain(60_000, deadline.signal),
+  ]);
+  clearTimeout(timer);
+
+  // The idle queue delivered its item and reports success; the hung queue is cut off by the shared deadline.
+  assert.deepEqual(delivered, [1]);
+  assert.equal(liveDone, true);
+  assert.equal(hungDone, false);
+
+  // An already-aborted shared deadline makes a non-idle drain return false at once, never awaiting.
+  const spent = new BoundedQueue<number>(4, () => undefined);
+  spent.start(() => new Promise<void>(() => undefined));
+  assert.equal(spent.enqueue(9), true);
+  assert.equal(await spent.drain(60_000, AbortSignal.abort()), false);
+});

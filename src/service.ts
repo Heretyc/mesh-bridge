@@ -19,7 +19,7 @@ import {
   type User,
 } from "discord.js";
 import { SerialPort } from "serialport";
-import { loadConfig, loadEnvironment, unsafeEnvPermissions, type ChannelPairConfig, type Config } from "./config.js";
+import { loadConfig, loadEnvironment, reloadChannelPairs, unsafeEnvPermissions, type ChannelPairConfig, type Config } from "./config.js";
 import {
   BoundedQueue,
   ReplyCorrelator,
@@ -172,6 +172,34 @@ export function resolveChannelPairs<T extends { meshtasticChannelName: string }>
   return resolvedPairs;
 }
 
+/**
+ * Names of every configured pair that did NOT resolve to a device channel (pending). Pure counterpart to
+ * resolveChannelPairs, exported so the loud-alert set can be unit-tested without opening a device: given the
+ * configured pairs and the resolved subset, it returns the meshtastic channel names left unresolved, in config
+ * order. Membership is by object identity — resolveChannelPairs returns the same pair references it was handed.
+ */
+export function unresolvedMeshChannelNames<T extends { meshtasticChannelName: string }>(
+  configured: Iterable<T>,
+  resolved: Array<[number, T]>,
+): string[] {
+  const resolvedPairs = new Set(resolved.map(([, pair]) => pair));
+  const names: string[] = [];
+  for (const pair of configured) {
+    if (!resolvedPairs.has(pair)) names.push(pair.meshtasticChannelName);
+  }
+  return names;
+}
+
+// Durability policy: one misconfigured channel never stops the service — it degrades gracefully and alerts
+// loudly. A configured pair that cannot be wired is re-checked, and its error re-logged, on this cadence until
+// it recovers (mesh: a name absent from the device; discord: an unresolvable channel id) — every two minutes.
+const CHANNEL_ALERT_INTERVAL_MS = 120_000;
+
+// One shared wall-clock budget for draining BOTH outbound queues on shutdown while the Discord and Mesh
+// transports are still alive. Kept under WinSW's 20s stoptimeout so the drain plus the transport teardown
+// that follows it still complete before the service manager force-kills the process.
+const SHUTDOWN_DRAIN_MS = 15_000;
+
 async function disconnectRejectedProbe(transport: TransportNodeSerial): Promise<void> {
   const onUnhandled = (error: unknown): void => {
     if (!(error instanceof DOMException && error.name === "AbortError")) throw error;
@@ -194,6 +222,11 @@ function abortPromise(signal: AbortSignal): Promise<void> {
 
 export class BridgeService {
   public readonly status = new StatusStore();
+  // Two distinct signals. `stopping` begins a graceful shutdown: it unblocks the reconnect loops so they
+  // return WITHOUT tearing down their live transport, leaving Discord and Mesh alive for the drain. `abort`
+  // is the hard transport/delivery kill, fired only after the drain completes (or a fatal error), so that
+  // work already accepted is delivered during shutdown instead of being cancelled the instant a stop begins.
+  private readonly stopping = new AbortController();
   private readonly abort = new AbortController();
   private readonly ipc: IpcServer;
   private readonly discordToMesh: BoundedQueue<OutboundJob>;
@@ -209,9 +242,12 @@ export class BridgeService {
   private mesh: MeshSession | undefined;
   private readonly telemetry: TelemetrySink;
   private lastMeshSend = 0;
+  /** Meshtastic channel names configured but absent from the current device (pending); alerted until they resolve. */
+  private readonly meshUnresolved = new Set<string>();
+  private meshUnresolvedTimer: NodeJS.Timeout | undefined;
 
   public constructor(private readonly config: Config) {
-    this.ipc = new IpcServer(config.ipcPort, config.ipcToken, this.status, () => this.abort.abort(new Error("IPC_SHUTDOWN")));
+    this.ipc = new IpcServer(config.ipcPort, config.ipcToken, this.status, () => this.stopping.abort(new Error("IPC_SHUTDOWN")));
     this.telemetry = new TelemetrySink({
       logFile: join(logDir(), "telemetry.jsonl"),
       secrets: [config.discordToken, config.ipcToken],
@@ -271,8 +307,8 @@ export class BridgeService {
   }
 
   public async run(): Promise<void> {
-    process.once("SIGINT", () => this.abort.abort(new Error("SIGINT")));
-    process.once("SIGTERM", () => this.abort.abort(new Error("SIGTERM")));
+    process.once("SIGINT", () => this.stopping.abort(new Error("SIGINT")));
+    process.once("SIGTERM", () => this.stopping.abort(new Error("SIGTERM")));
     await this.ipc.start();
     this.status.event("info", "SERVICE_STARTED", { ipcPort: this.config.ipcPort });
 
@@ -287,6 +323,9 @@ export class BridgeService {
       await Promise.all([this.discordLoop(), this.meshLoop()]);
     } catch (error) {
       this.status.event("error", "SERVICE_FATAL", { reason: reason(error) });
+      // A fatal error is a hard stop, not a graceful drain: unblock the loops AND kill transports at once so
+      // the shutdown drain (which sees an already-aborted signal) returns immediately rather than waiting.
+      this.stopping.abort(error);
       this.abort.abort(error);
       throw error;
     } finally {
@@ -305,7 +344,7 @@ export class BridgeService {
 
   private async discordLoop(): Promise<void> {
     let attempt = 0;
-    while (!this.abort.signal.aborted) {
+    while (!this.stopping.signal.aborted) {
       this.status.link("discord", "connecting");
       const client = new Client({
         intents: [
@@ -345,45 +384,121 @@ export class BridgeService {
         });
       });
 
+      let channelRetry: NodeJS.Timeout | undefined;
       try {
         const ready = this.waitForDiscordReady(client);
         await Promise.all([client.login(this.config.discordToken), ready]);
         if (client.user?.username !== "Mesh Bridge") {
           throw new FatalConfigurationError(`Discord bot username must be exactly "Mesh Bridge"; found "${client.user?.username ?? "unknown"}"`);
         }
-        // Validate every configured Discord channel before wiring any handle, so a mid-list failure never
-        // leaves a half-populated routing table behind a client that is about to be destroyed.
+        // Durability policy: resolve every configured Discord channel independently. A channel-level failure
+        // (Unknown Channel, Missing Access, not sendable, missing permissions) is NEVER fatal — the channels
+        // that resolve are wired and bridge immediately, while each broken one is re-attempted every two
+        // minutes from a fresh read of config.jsonc so an operator can correct a bad id without a restart.
+        // Only an invalid token stays fatal. Handles are committed only after the pass, so a fatal mid-pass
+        // never leaves a half-populated routing table behind a client about to be destroyed.
         const resolved: Array<[PairState, SendableChannels]> = [];
+        const broken: PairState[] = [];
         for (const pair of this.pairsByDiscordId.values()) {
-          const channel = await client.channels.fetch(pair.discordChannelId);
-          if (!channel || !channel.isSendable() || channel.isDMBased()) {
-            throw new FatalConfigurationError(`Discord channel ${JSON.stringify(pair.discordChannelId)} is not a sendable server channel visible to Mesh Bridge`);
+          try {
+            resolved.push([pair, await this.resolveDiscordChannel(client, pair.discordChannelId)]);
+          } catch (error) {
+            if (/invalid token/i.test(reason(error))) throw error;
+            broken.push(pair);
+            this.status.event("error", "DISCORD_CHANNEL_UNRESOLVED", { discordChannelId: pair.discordChannelId, reason: reason(error) });
           }
-          if (!hasRequiredDiscordPermissions(channel.permissionsFor(client.user))) {
-            throw new FatalConfigurationError(`Mesh Bridge needs View Channel, Send Messages, Read Message History, and Add Reactions in Discord channel ${JSON.stringify(pair.discordChannelId)}`);
-          }
-          resolved.push([pair, channel]);
         }
         for (const [pair, channel] of resolved) pair.discordChannel = channel;
         this.discord = client;
         this.status.link("discord", "online");
-        this.status.event("info", "DISCORD_CONNECTED");
+        this.status.event("info", "DISCORD_CONNECTED", { resolved: resolved.length, broken: broken.length });
         attempt = 0;
-        await Promise.race([invalid, abortPromise(this.abort.signal)]);
+        if (broken.length > 0) channelRetry = this.startDiscordChannelRetry(client, broken);
+        await Promise.race([invalid, abortPromise(this.stopping.signal)]);
       } catch (error) {
         if (error instanceof FatalConfigurationError || /invalid token/i.test(reason(error))) throw error;
-        if (!this.abort.signal.aborted) {
+        if (!this.stopping.signal.aborted) {
           this.status.link("discord", "error");
           this.status.event("error", "DISCORD_CONNECT_FAILED", { reason: reason(error), retryMs: backoff(attempt) });
         }
       } finally {
-        if (this.discord === client) {
-          this.discord = undefined;
-          for (const pair of this.pairsByDiscordId.values()) pair.discordChannel = undefined;
+        if (channelRetry !== undefined) clearInterval(channelRetry);
+        // On a graceful stop leave the live client intact so shutdown() can drain outbound work through it and
+        // destroy it only afterwards; on a reconnect (or a non-live client mid-connect) tear it down as usual.
+        if (!(this.stopping.signal.aborted && this.discord === client)) {
+          if (this.discord === client) {
+            this.discord = undefined;
+            for (const pair of this.pairsByDiscordId.values()) pair.discordChannel = undefined;
+          }
+          client.destroy();
         }
-        client.destroy();
       }
-      if (!this.abort.signal.aborted) await delay(backoff(attempt++), this.abort.signal);
+      if (!this.stopping.signal.aborted) await delay(backoff(attempt++), this.stopping.signal);
+    }
+  }
+
+  // Fetch and validate one configured Discord channel. Throws a plain Error (channel-level, non-fatal) whose
+  // message names the id when the channel is missing, not a sendable server channel, or missing the bridge's
+  // required permissions; the caller keeps every other working channel bridging and retries this one.
+  private async resolveDiscordChannel(client: Client, discordChannelId: string): Promise<SendableChannels> {
+    const channel = await client.channels.fetch(discordChannelId);
+    if (!channel || !channel.isSendable() || channel.isDMBased()) {
+      throw new Error(`Discord channel ${JSON.stringify(discordChannelId)} is not a sendable server channel visible to Mesh Bridge`);
+    }
+    // client.user is non-null here: this runs only after login + the "Mesh Bridge" username check succeed.
+    if (!hasRequiredDiscordPermissions(channel.permissionsFor(client.user!))) {
+      throw new Error(`Mesh Bridge needs View Channel, Send Messages, Read Message History, and Add Reactions in Discord channel ${JSON.stringify(discordChannelId)}`);
+    }
+    return channel;
+  }
+
+  // Re-attempt every unresolved Discord channel every two minutes for as long as the client stays up. Each pass
+  // re-reads config.jsonc so a corrected id is honored live; the loud DISCORD_CHANNEL_UNRESOLVED error repeats
+  // per still-broken channel until it recovers. The interval is unref'd and cleared when the client tears down.
+  private startDiscordChannelRetry(client: Client, broken: PairState[]): NodeJS.Timeout {
+    let pending = [...broken];
+    let running = false;
+    const timer = setInterval(() => {
+      if (running) return; // never overlap a slow pass with the next tick
+      running = true;
+      void (async () => {
+        const stillBroken: PairState[] = [];
+        for (const pair of pending) {
+          if (this.discord !== client) return; // client torn down mid-pass; stop touching its handles
+          if (!(await this.retryDiscordChannel(client, pair))) stillBroken.push(pair);
+        }
+        pending = stillBroken;
+        if (pending.length === 0) clearInterval(timer);
+      })().finally(() => { running = false; });
+    }, CHANNEL_ALERT_INTERVAL_MS);
+    timer.unref();
+    return timer;
+  }
+
+  // One retry attempt for a single broken pair. Re-reads config.jsonc so an operator's corrected id (matched by
+  // the stable meshtastic name) is picked up without a restart; on success wires the handle, re-keys the routing
+  // map if the id changed, and logs recovery. Never throws — a failed attempt just re-logs the loud error.
+  private async retryDiscordChannel(client: Client, pair: PairState): Promise<boolean> {
+    let desiredId = pair.discordChannelId;
+    try {
+      const fresh = reloadChannelPairs().find((entry) => entry.meshtasticChannelName === pair.meshtasticChannelName);
+      if (fresh !== undefined) desiredId = fresh.discordChannelId;
+    } catch (error) {
+      this.status.event("error", "DISCORD_CONFIG_RELOAD_FAILED", { discordChannelId: pair.discordChannelId, reason: reason(error) });
+    }
+    try {
+      const channel = await this.resolveDiscordChannel(client, desiredId);
+      if (desiredId !== pair.discordChannelId && !this.pairsByDiscordId.has(desiredId)) {
+        this.pairsByDiscordId.delete(pair.discordChannelId);
+        pair.discordChannelId = desiredId;
+        this.pairsByDiscordId.set(desiredId, pair);
+      }
+      pair.discordChannel = channel;
+      this.status.event("info", "DISCORD_CHANNEL_RESOLVED", { discordChannelId: pair.discordChannelId });
+      return true;
+    } catch (error) {
+      this.status.event("error", "DISCORD_CHANNEL_UNRESOLVED", { discordChannelId: desiredId, reason: reason(error) });
+      return false;
     }
   }
 
@@ -395,9 +510,9 @@ export class BridgeService {
         resolve();
       };
       client.once(Events.ClientReady, done);
-      this.abort.signal.addEventListener("abort", () => {
+      this.stopping.signal.addEventListener("abort", () => {
         clearTimeout(timer);
-        reject(this.abort.signal.reason);
+        reject(this.stopping.signal.reason);
       }, { once: true });
     });
   }
@@ -567,31 +682,79 @@ export class BridgeService {
 
   private async meshLoop(): Promise<void> {
     let attempt = 0;
-    while (!this.abort.signal.aborted) {
+    while (!this.stopping.signal.aborted) {
       this.status.link("meshtastic", "connecting");
       try {
         const session = await this.openMesh();
         this.mesh = session;
         this.status.link("meshtastic", "online");
         this.status.event("info", "MESHTASTIC_CONNECTED", { channels: session.resolvedPairs.map(([index]) => index) });
+        // Durability policy: a name absent from this device leaves its pair pending, never stops the service.
+        // Alert loudly for each unresolved name and keep re-alerting every two minutes until it recovers.
+        this.reconcileMeshResolution(session.resolvedPairs);
         attempt = 0;
-        await Promise.race([session.disconnected, abortPromise(this.abort.signal)]);
+        await Promise.race([session.disconnected, abortPromise(this.stopping.signal)]);
       } catch (error) {
         if (error instanceof FatalConfigurationError) throw error;
-        if (!this.abort.signal.aborted) {
+        if (!this.stopping.signal.aborted) {
           this.status.link("meshtastic", "error");
           this.status.event("error", "MESHTASTIC_CONNECT_FAILED", { reason: reason(error), retryMs: backoff(attempt) });
         }
       } finally {
-        const session = this.mesh;
-        this.mesh = undefined;
-        if (session) await session.close().catch(() => undefined);
-        // Tear down mesh->discord routing but keep every configured pair row, now shown as pending.
-        this.pairsByMeshChannel.clear();
-        for (const pair of this.pairsByDiscordId.values()) pair.meshChannel = undefined;
-        this.status.connection({ serialPort: "-", localNode: "-", channelPairs: this.channelPairsStatus() });
+        // On a graceful stop leave the live session intact so shutdown() can drain outbound sends through it and
+        // close it only afterwards; on a reconnect (or when no session came up) tear the routing down as usual.
+        if (!(this.stopping.signal.aborted && this.mesh !== undefined)) {
+          const session = this.mesh;
+          this.mesh = undefined;
+          if (session) await session.close().catch(() => undefined);
+          // Tear down mesh->discord routing but keep every configured pair row, now shown as pending.
+          this.pairsByMeshChannel.clear();
+          for (const pair of this.pairsByDiscordId.values()) pair.meshChannel = undefined;
+          // The whole session is gone (a separate meshtastic link alert covers that), so stop the per-name
+          // unresolved alerting; the next successful connect reconciles and re-alerts any still-missing name.
+          this.stopMeshResolutionAlerts();
+          this.status.connection({ serialPort: "-", localNode: "-", channelPairs: this.channelPairsStatus() });
+        }
       }
-      if (!this.abort.signal.aborted) await delay(backoff(attempt++), this.abort.signal);
+      if (!this.stopping.signal.aborted) await delay(backoff(attempt++), this.stopping.signal);
+    }
+  }
+
+  // Compare the configured pairs against what resolved on the live device. Names newly missing raise one loud
+  // MESH_CHANNEL_UNRESOLVED error; names that came back raise MESH_CHANNEL_RESOLVED. While any name is missing a
+  // two-minute interval re-raises the loud error so a lingering misconfiguration cannot go quiet.
+  private reconcileMeshResolution(resolvedPairs: Array<[number, PairState]>): void {
+    const pending = unresolvedMeshChannelNames(this.pairsByDiscordId.values(), resolvedPairs);
+    const pendingSet = new Set(pending);
+    for (const name of this.meshUnresolved) {
+      if (!pendingSet.has(name)) this.status.event("info", "MESH_CHANNEL_RESOLVED", { meshtasticChannelName: name });
+    }
+    const newlyBroken = pending.filter((name) => !this.meshUnresolved.has(name));
+    this.meshUnresolved.clear();
+    for (const name of pending) this.meshUnresolved.add(name);
+    if (newlyBroken.length > 0) {
+      this.status.event("error", "MESH_CHANNEL_UNRESOLVED", { meshtasticChannelNames: newlyBroken });
+    }
+    if (this.meshUnresolved.size === 0) {
+      this.clearMeshUnresolvedTimer();
+    } else if (this.meshUnresolvedTimer === undefined) {
+      this.meshUnresolvedTimer = setInterval(() => {
+        this.status.event("error", "MESH_CHANNEL_UNRESOLVED", { meshtasticChannelNames: [...this.meshUnresolved], repeat: true });
+      }, CHANNEL_ALERT_INTERVAL_MS);
+      this.meshUnresolvedTimer.unref();
+    }
+  }
+
+  // Silence the mesh unresolved-channel alerting (session gone or service stopping); no recovery log is emitted.
+  private stopMeshResolutionAlerts(): void {
+    this.clearMeshUnresolvedTimer();
+    this.meshUnresolved.clear();
+  }
+
+  private clearMeshUnresolvedTimer(): void {
+    if (this.meshUnresolvedTimer !== undefined) {
+      clearInterval(this.meshUnresolvedTimer);
+      this.meshUnresolvedTimer = undefined;
     }
   }
 
@@ -853,16 +1016,32 @@ export class BridgeService {
     }
   }
 
-  private async shutdown(): Promise<void> {
-    this.abort.abort(new Error("shutdown"));
+  private async shutdown(drainMs = SHUTDOWN_DRAIN_MS): Promise<void> {
+    // (a) Stop ingress and unblock the reconnect loops. `stopping` may already be aborted (a SIGTERM/IPC
+    // stop or a fatal error triggered this); firing it again is idempotent. The transport signal is NOT
+    // aborted yet, so the delivery workers can keep using the live Discord and Mesh transports below.
+    this.stopping.abort(new Error("shutdown"));
+    this.clearMeshUnresolvedTimer();
     this.status.event("info", "SERVICE_STOPPING");
-    // Abort has already told every worker to bail, so the drains only wait out the in-flight item.
-    // Release Discord, the mesh session, and IPC alongside that short, tightly-budgeted wait rather
-    // than strictly after a full-budget drain, so a slow drain can't eat WinSW's whole stop budget
-    // and get the process force-killed. discord.destroy() returns a promise here, so it is awaited.
+    // (b) Drain BOTH outbound queues under ONE shared wall-clock deadline while the transports are still
+    // alive, so work already accepted is actually delivered instead of being dropped. A stuck worker cannot
+    // outlast the shared deadline, so this is bounded even if a queue never goes idle. When shutdown runs
+    // after a fatal error the transport signal is already aborted, so the workers bail and the drains return
+    // at once rather than waiting the full budget.
+    const deadline = new AbortController();
+    const deadlineTimer = setTimeout(() => deadline.abort(), drainMs);
+    try {
+      await Promise.all([
+        this.discordToMesh.drain(drainMs, deadline.signal),
+        this.meshToDiscord.drain(drainMs, deadline.signal),
+      ]);
+    } finally {
+      clearTimeout(deadlineTimer);
+    }
+    // (c) Only now cancel any in-flight send and tear the transports down. discord.destroy() returns a
+    // promise here, so it is awaited alongside the mesh session close and the IPC server close.
+    this.abort.abort(new Error("shutdown"));
     await Promise.all([
-      this.discordToMesh.drain(5_000),
-      this.meshToDiscord.drain(5_000),
       this.discord?.destroy() ?? Promise.resolve(),
       this.mesh?.close().catch(() => undefined) ?? Promise.resolve(),
       this.ipc.close(),

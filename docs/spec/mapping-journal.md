@@ -39,6 +39,14 @@ rewrites the file with only live entries, sorted by ascending timestamp. The
 rewrite preserves the union of both directions, so a live mesh alias is not lost
 just because the reverse canonical-root entry was independently evicted.
 
+Compaction is gated on a successful startup replay. If the startup read fails
+for any non-missing-file reason, the in-memory maps stay empty but the on-disk
+file is still recoverable, so compaction becomes a no-op for the process
+lifetime: neither the daily 02:00 timer nor `close()` may rewrite the file. This
+prevents an empty rebuild from clobbering recoverable data, letting a later
+healthy restart replay the intact file. Each skipped compaction logs one stderr
+warning. Appends still fail open.
+
 Canonical-root-versus-alias semantics match `ReplyCorrelator`:
 
 - `recordOutboundChunk` maps every nonzero mesh chunk id to the Discord message.

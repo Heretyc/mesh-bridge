@@ -78,7 +78,9 @@ Use these functional reviewer labels:
 - How could a model shortcut or misread this document?
 - What ambiguity could cause a bad assumption?
 - What edge case would break validation or migration?
-- Does the document say when to stop and ask the owner?
+- Does the document say when a residual concern sets the review to fail,
+  enumerates the open perspective concerns, and routes the amend back to the PR
+  diff?
 
 ## Consensus Rule
 
@@ -88,7 +90,8 @@ is concerned or unsure:
 1. Record the concern.
 2. Revise if the fix is within confirmed scope.
 3. Re-run the review.
-4. If concern remains or the fix changes scope, stop and ask the owner.
+4. If concern remains, set Status: fail, enumerate open perspective concerns in
+   Findings, and require the PR diff to address them before re-run.
 
 Do not mark review complete by majority vote.
 

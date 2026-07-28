@@ -115,7 +115,15 @@ function matchesToken(received: string, expected: string): boolean {
   return left.length === right.length && timingSafeEqual(left, right);
 }
 
+// Absolute deadline for a freshly accepted socket to present its token. Unlike a resettable inactivity
+// timeout, this bound cannot be extended by a client that dribbles bytes, so a pre-auth socket can never
+// keep the server alive past it and block shutdown.
+const IPC_AUTH_TIMEOUT_MS = 5_000;
+
 export class IpcServer {
+  /** Every accepted socket, authenticated or not, so close() can guarantee-destroy all of them. */
+  private readonly sockets = new Set<Socket>();
+  /** Authenticated subscribers only; the broadcast target set. Always a subset of `sockets`. */
   private readonly clients = new Set<Socket>();
   private server?: Server;
   private readonly broadcast = (): void => {
@@ -132,7 +140,7 @@ export class IpcServer {
 
   public start(): Promise<void> {
     return new Promise((resolveStart, reject) => {
-      this.server = createServer((socket) => this.authenticate(socket));
+      this.server = createServer((socket) => this.accept(socket));
       this.server.once("error", reject);
       this.server.listen({ host: "127.0.0.1", port: this.port, exclusive: true }, () => {
         this.server?.off("error", reject);
@@ -145,13 +153,27 @@ export class IpcServer {
 
   public async close(): Promise<void> {
     this.store.off("changed", this.broadcast);
-    for (const socket of this.clients) socket.destroy();
+    // Destroy EVERY accepted socket, including any still mid-authentication, so server.close() is never left
+    // waiting on a connection that never authenticated.
+    for (const socket of this.sockets) socket.destroy();
     await new Promise<void>((resolveClose) => this.server?.close(() => resolveClose()) ?? resolveClose());
   }
 
+  // Track a socket from the instant it is accepted, before any auth, and drop it from both sets when it closes.
+  private accept(socket: Socket): void {
+    this.sockets.add(socket);
+    socket.on("error", () => undefined);
+    socket.on("close", () => {
+      this.sockets.delete(socket);
+      this.clients.delete(socket);
+    });
+    this.authenticate(socket);
+  }
+
   private authenticate(socket: Socket): void {
-    socket.on("error", () => this.clients.delete(socket));
-    socket.setTimeout(5_000, () => socket.destroy());
+    // Absolute deadline, not a resettable inactivity timeout: a partial-token client cannot extend it.
+    const authTimer = setTimeout(() => socket.destroy(), IPC_AUTH_TIMEOUT_MS);
+    authTimer.unref();
     let input = "";
     const onData = (chunk: Buffer): void => {
       input += chunk.toString("utf8");
@@ -166,7 +188,7 @@ export class IpcServer {
         socket.destroy();
         return;
       }
-      socket.setTimeout(0);
+      clearTimeout(authTimer);
       // Any bytes buffered after the token's newline are command data that
       // arrived in the same TCP segment; seed the command buffer with them so
       // they are not dropped when the post-auth handler is installed.
@@ -191,7 +213,6 @@ export class IpcServer {
         processCommands();
       };
       socket.on("data", onCommand);
-      socket.on("close", () => this.clients.delete(socket));
       this.clients.add(socket);
       socket.write(`${JSON.stringify(this.store.snapshot())}\n`);
       // Process residual command bytes already buffered from the auth segment.

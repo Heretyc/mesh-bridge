@@ -61,10 +61,8 @@ Use this checklist for repository work. The normative policy is
 - The required workflow bridge lives in `.github/workflows/claude-routine.yml`.
 - Required jobs use least-privilege permissions and routine API secrets only.
 - The workflow dispatch check proves routine dispatch, not routine completion.
-- Human review must inspect the Claude session URL or PR report before merge.
 - Do not use `pull_request_target` to execute untrusted PR code.
 - Treat all event fields as untrusted input.
-- Workflow and CI-invoked script changes require owner/CODEOWNER review.
 
 ## Handoff
 

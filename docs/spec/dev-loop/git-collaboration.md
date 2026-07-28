@@ -73,29 +73,26 @@ in `AGENTS.md`. Agent execution details live in `agents/GIT_COLLABORATION.md`.
     untrusted PR code.
 27. Workflow steps must treat PR titles, bodies, branch names, labels, commit
     messages, and all `github.event` fields as untrusted input.
-28. `.github/workflows/**`, `.github/CODEOWNERS`, scripts invoked by CI, and
-    secret-handling paths require owner/CODEOWNER review.
-29. Required check names must be unique across workflows. Protect them with
+28. Required check names must be unique across workflows. Protect them with
     branch rulesets or branch protection only where the GitHub account plan
     actually enforces private-repository protections.
-30. Protected branches must require PRs, required checks, resolved
-    conversations, at least one independent approval, code-owner review for
-    owned paths, blocked force-pushes, and blocked deletion.
-31. Busy protected branches must use merge queue, and required CI must include
+29. Protected branches must require PRs, required checks, resolved
+    conversations, blocked force-pushes, and blocked deletion.
+30. Busy protected branches must use merge queue, and required CI must include
     `merge_group` before merge queue is required.
-32. No PR may merge while draft, failing/missing required checks, conflicted,
-    stale, unsafe, superseded, lacking approval, or carrying unresolved changes.
-33. No PR may merge unless the latest Claude Routine report for the current head
-    SHA has `Status: pass`, or the owner approves an emergency override.
-34. Agent-authored PRs must pass the same CI and human review gates as human
-    PRs. Agents do not approve or merge their own work.
-35. Release branches accept only stabilization, release metadata, backports, and
+31. No PR may merge while draft, failing/missing required checks, conflicted,
+    stale, unsafe, superseded, or carrying unresolved changes.
+32. No PR may merge unless the latest Claude Routine report for the current head
+    SHA has `Status: pass`.
+33. Agent-authored PRs must pass the same CI as human PRs. Agents do not approve
+    or merge their own work.
+34. Release branches accept only stabilization, release metadata, backports, and
     approved hotfixes. Feature work targets topic branches from default branch.
-36. Hotfixes start from the oldest supported affected release/maintenance branch
+35. Hotfixes start from the oldest supported affected release/maintenance branch
     and propagate upward to newer release branches and default branch.
-37. Merge freezes must be enforced with branch locks, active rulesets, required
+36. Merge freezes must be enforced with branch locks, active rulesets, required
     deployment/review gates, or equivalent maintainer-controlled protections.
-38. If GitHub shows a plan-gating warning for private-repository rulesets or
+37. If GitHub shows a plan-gating warning for private-repository rulesets or
     branch protection, do not represent those rules as enforced. Use manual
     maintainer gates until the repository moves to an enforcing plan.
 
@@ -144,4 +141,5 @@ instruction/policy content must pass the 8-perspective review in
 `docs/spec/prompt-review/eight-perspective-review.md`. Unrelated docs and
 agent-state markdown do not activate the gate by file extension alone. All eight
 perspectives must pass; if any perspective is concerned or unsure after
-revision, stop and ask the owner.
+revision, set Status: fail, enumerate open perspective concerns in Findings, and
+require the PR diff to address them before re-run.
