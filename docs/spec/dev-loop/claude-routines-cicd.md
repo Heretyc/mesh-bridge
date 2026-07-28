@@ -94,6 +94,8 @@ Target SHA: <sha checked out for validation>
 - JSON syntax: pass|fail|blocked
 - Python syntax: pass|fail|blocked
 - Branch and PR policy: pass|fail|blocked
+- Scope coherence: pass|fail|blocked
+- Project Board currency: pass|fail|blocked
 - Claude CI/CD mapping: pass|fail|blocked
 - Security: pass|fail|blocked
 - Attribution: pass|fail|blocked

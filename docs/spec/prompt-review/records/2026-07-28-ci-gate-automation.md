@@ -90,7 +90,7 @@ owner-accepted design bounds each.
   policy it enforces; the raise is justified only as the minimum needed to hold
   the Law verbatim, not as license to grow `AGENTS.md` unboundedly.
 - Revisions made: Removed the `GitHub governance` line from both report
-  templates so the report list matches the defined checks exactly. Added the
+  templates so the report list no longer names an undefined check. Added the
   affirmative single-gate statement to `claude-routines-cicd.md` Enforcement —
   the `claude-routine-verdict` status for the current head SHA is the merge gate
   and merge proceeds only on success — and reworked the plan-gating passage so
