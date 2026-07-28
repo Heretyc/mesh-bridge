@@ -78,7 +78,9 @@ Use these functional reviewer labels:
 - How could a model shortcut or misread this document?
 - What ambiguity could cause a bad assumption?
 - What edge case would break validation or migration?
-- Does the document say when to stop and ask the owner?
+- Does the document say when a residual concern sets the review to fail,
+  enumerates the open perspective concerns, and routes the amend back to the PR
+  diff?
 
 ## Consensus Rule
 

@@ -94,7 +94,6 @@ Target SHA: <sha checked out for validation>
 - JSON syntax: pass|fail|blocked
 - Python syntax: pass|fail|blocked
 - Branch and PR policy: pass|fail|blocked
-- GitHub governance: pass|fail|blocked
 - Claude CI/CD mapping: pass|fail|blocked
 - Security: pass|fail|blocked
 - Attribution: pass|fail|blocked
@@ -110,19 +109,19 @@ Target SHA: <sha checked out for validation>
 
 ## Enforcement
 
-- Branch protection or rulesets should require `claude-routine-dispatch` and
-  `claude-routine-verdict` only on GitHub plans where private-repository
-  protections are actually enforced.
-- On private repositories where GitHub shows a plan-gating warning, do not treat
-  rulesets or branch protection as enforceable.
-- The `claude-routine-dispatch` check proves that GitHub successfully fired the
-  routine. It does not prove that the routine completed successfully. The
+- The `claude-routine-verdict` commit status for the current head SHA is the
+  merge gate; merge proceeds only when it reports success.
+- Branch protection or rulesets require `claude-routine-dispatch` and
+  `claude-routine-verdict` on GitHub plans where private-repository protections
+  are enforced. Where GitHub shows a plan-gating warning, GitHub-side
+  enforcement may be unavailable; the `claude-routine-verdict` status remains
+  the gate, and a maintainer confirms it green for the current head SHA before
+  merge.
+- The `claude-routine-dispatch` check proves that GitHub fired the routine; the
   `claude-routine-verdict` status proves the routine's latest report for the
   current head SHA carries `Status: pass`.
-- No PR may merge unless the latest Claude Routine report for the current head
-  SHA has `Status: pass`.
-- If the routine API, token, quota, or webhook delivery fails, the PR does not
-  merge.
+- A failure of the routine API, token, quota, or webhook delivery leaves the
+  verdict status unset, which holds the PR back from merge.
 - If direct GitHub-event routines are enabled in Claude, keep the workflow
   bridge anyway so GitHub has a required status check.
 - The verdict status is posted per PR head SHA. If a merge queue is enabled,
