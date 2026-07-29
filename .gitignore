@@ -12,3 +12,5 @@ logs/
 *.wrapper.log
 *.lnk
 .agents/
+.agents/project-ci.env
+.agents/project-board-law/journal.ndjson
