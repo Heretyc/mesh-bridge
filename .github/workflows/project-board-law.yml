@@ -58,16 +58,35 @@ permissions:
 # 2. Manual dispatch. Running a workflow manually needs only write access and the
 #    triggerer chooses the ref, so a `workflow_dispatch` from an attacker branch
 #    would otherwise run that branch's manager with the token. Event conditions
-#    alone cannot prevent this. Every token-bearing job therefore declares
-#    `environment: project-board-law`; environment secrets reach only jobs that use
+#    alone cannot prevent this. Every token-bearing job therefore declares the
+#    `project-board-law` environment; environment secrets reach only jobs that use
 #    the environment and only after its protection rules pass.
+#
+#    The environment here is a SECRET-SCOPING GATE, not a deployment. Each
+#    token-bearing job declares it as
+#      environment:
+#        name: project-board-law
+#        deployment: false
+#    `deployment: false` suppresses the Deployments-UI record GitHub would
+#    otherwise create for every environment run, so this governance never
+#    masquerades as a release in the Deployments timeline. Verified 2026-08-03:
+#    with `deployment: false` the environment's deployment BRANCH PROTECTION RULES
+#    are still enforced (a non-allowed ref fails with "Branch ... is not allowed to
+#    deploy to project-board-law due to environment protection rules." and no
+#    secret is delivered), and ZERO deployment objects are created. The environment
+#    therefore remains MANDATORY: it, not `deployment: false`, is what keeps the
+#    token away from untrusted refs. Caveat (GitHub docs): `deployment: false` is
+#    INCOMPATIBLE with custom GitHub App deployment protection rules — a job that
+#    declares it fails immediately if such a rule guards the environment; use only
+#    native branch policies. `inspect` enforces this posture (see manager.js).
 #
 # INSTALL REQUIREMENT: create that environment, restrict its deployment branches to
 # the DEFAULT BRANCH ONLY (never `refs/pull/*/merge`), and store PROJECT_CI_TOKEN
 # *in the environment*. A repository-level secret of the same name would resolve
 # here regardless of the environment and silently defeat this control. An
 # environment that does not exist yet is created on first use with no protection
-# rules, which also defeats it. See INSTALL.md.
+# rules, which also defeats it. Do NOT add a custom GitHub App deployment
+# protection rule: it is incompatible with `deployment: false`. See INSTALL.md.
 
 jobs:
   # Untrusted context: runs pull-request-controlled code, so it has no secret and
@@ -78,7 +97,12 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
+      # No secret is needed here, but the checkout runs before PR-controlled
+      # JavaScript executes below. Drop the persisted GITHUB_TOKEN from .git/config
+      # so author-controlled code can never read it. Keeps this job token-free.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
@@ -98,7 +122,13 @@ jobs:
 
           const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
           const fail = (message) => { console.error(message); process.exitCode = 1; };
+          const customizable = ".agents/project-board-law/INSTALL.md";
           for (const [target, encoded] of Object.entries(PAYLOADS)) {
+            if (target === customizable) {
+              // Sole customizable installed artifact: present and readable, not byte-identical.
+              try { readFileSync(target); } catch { fail(`installation guide missing: ${target}`); }
+              continue;
+            }
             if (!readFileSync(target).equals(Buffer.from(encoded, "base64"))) {
               fail(`vendored payload differs: ${target}`);
             }
@@ -142,7 +172,9 @@ jobs:
   live-board:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request_target'
-    environment: project-board-law
+    environment:
+      name: project-board-law
+      deployment: false
     permissions:
       contents: read
       statuses: write
@@ -160,15 +192,67 @@ jobs:
         with:
           node-version: 24
       # The PAT is scoped to this single step; no other step in the job sees it.
+      # Capture the FULL manager result under $RUNNER_TEMP and emit only a bounded,
+      # secret-free compliance summary to the Actions log — status, violation count,
+      # and violation check ids (machine slugs) — never the raw inspection JSON,
+      # which carries Project item data, issue numbers, assignees, and PR metadata.
+      # Mirrors how the trusted `inspect` job bounds its output. The manager exit
+      # code is preserved so steps.inspect.outcome fails closed and the status
+      # published below reflects true compliance.
       - name: Inspect governance from base-controlled code
         id: inspect
         env:
           PROJECT_CI_TOKEN: ${{ secrets.PROJECT_CI_TOKEN }}
         shell: bash
-        run: >-
-          node .agents/project-board-law/manager.js inspect
-          --repo "https://github.com/${GITHUB_REPOSITORY}"
-          --project "$PROJECT_BOARD_PROJECT_URL"
+        run: |
+          set +e
+          node .agents/project-board-law/manager.js inspect \
+            --repo "https://github.com/${GITHUB_REPOSITORY}" \
+            --project "$PROJECT_BOARD_PROJECT_URL" \
+            >"$RUNNER_TEMP/inspect.stdout" 2>"$RUNNER_TEMP/inspect.stderr"
+          inspect_exit=$?
+          cat > "$RUNNER_TEMP/summarize-inspect.mjs" <<'NODE'
+          import { readFileSync } from "node:fs";
+
+          const CHECK_CAP = 50;
+          const exit = Number.parseInt(process.env.INSPECT_EXIT ?? "", 10);
+          let parsed = null;
+          try {
+            const text = readFileSync(process.env.INSPECT_STDOUT, "utf8").trim();
+            parsed = text ? JSON.parse(text) : null;
+          } catch {
+            parsed = null;
+          }
+          // Emit ONLY violation check ids (the machine slugs) from the two
+          // token-bearing posture reports — never messages, issue numbers,
+          // assignees, or any Project/PR payload.
+          const slug = /^[a-z][a-z0-9-]*$/;
+          const collect = (report) => {
+            const list = report && Array.isArray(report.violations) ? report.violations : [];
+            return list
+              .map((entry) => (entry && typeof entry.check === "string" ? entry.check : ""))
+              .filter((id) => slug.test(id));
+          };
+          let status = "unavailable";
+          let checks = [];
+          if (parsed && typeof parsed === "object" && typeof parsed.compliant === "boolean") {
+            status = parsed.compliant ? "compliant" : "noncompliant";
+            checks = [...collect(parsed.environmentPosture), ...collect(parsed.branchProtection)];
+          }
+          const capped = checks.slice(0, CHECK_CAP);
+          const summary = {
+            status,
+            exit,
+            violation_count: checks.length,
+            violation_checks: capped,
+            violation_checks_truncated: checks.length > capped.length,
+          };
+          console.log(`live-board inspection ${JSON.stringify(summary)}`);
+          NODE
+          INSPECT_STDOUT="$RUNNER_TEMP/inspect.stdout" \
+          INSPECT_EXIT="$inspect_exit" \
+          node "$RUNNER_TEMP/summarize-inspect.mjs"
+          exit "$inspect_exit"
       # Publish the fixed status with the job-scoped GITHUB_TOKEN (never the PAT).
       # Runs on success or failure so a failed inspect fails the required check.
       - name: Publish fixed project-board-law/live-board status
@@ -231,7 +315,9 @@ jobs:
   inspect:
     runs-on: ubuntu-latest
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    environment: project-board-law
+    environment:
+      name: project-board-law
+      deployment: false
     env:
       # Repository variable naming the governed Project, for example
       # https://github.com/users/OWNER/projects/NUMBER or
@@ -242,14 +328,221 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
+      # Trusted-context inspection. Capture the manager result under $RUNNER_TEMP,
+      # preserve its exit code, and reduce it to a bounded, secret-free callback
+      # envelope. Raw stdout/stderr stay in runner temp and are never uploaded.
+      # continue-on-error lets a noncompliant or unavailable inspection still
+      # deliver its callback; the final gate below restores fail-closed exit.
       - name: Verify vendored governance
+        id: inspect
+        continue-on-error: true
         env:
           PROJECT_CI_TOKEN: ${{ secrets.PROJECT_CI_TOKEN }}
         shell: bash
-        run: >-
-          node .agents/project-board-law/manager.js inspect
-          --repo "https://github.com/${GITHUB_REPOSITORY}"
-          --project "$PROJECT_BOARD_PROJECT_URL"
+        run: |
+          set +e
+          node .agents/project-board-law/manager.js inspect \
+            --repo "https://github.com/${GITHUB_REPOSITORY}" \
+            --project "$PROJECT_BOARD_PROJECT_URL" \
+            >"$RUNNER_TEMP/inspect.stdout" 2>"$RUNNER_TEMP/inspect.stderr"
+          inspect_exit=$?
+          cat > "$RUNNER_TEMP/build-callback.mjs" <<'NODE'
+          import { readFileSync, writeFileSync } from "node:fs";
+
+          const REFS_CAP = 50;
+          const bool = (value) => value === true;
+          const nonNegInt = (value) => (Number.isInteger(value) && value >= 0 ? value : 0);
+
+          const exit = Number.parseInt(process.env.INSPECT_EXIT ?? "", 10);
+          let parsed = null;
+          try {
+            const text = readFileSync(process.env.INSPECT_STDOUT, "utf8").trim();
+            parsed = text ? JSON.parse(text) : null;
+          } catch {
+            parsed = null;
+          }
+          // A structurally valid result is an object whose `compliant` boolean
+          // matches the manager exit contract: 0 => compliant, 2 => noncompliant.
+          const valid =
+            parsed !== null &&
+            typeof parsed === "object" &&
+            typeof parsed.compliant === "boolean" &&
+            ((exit === 0 && parsed.compliant === true) ||
+              (exit === 2 && parsed.compliant === false));
+
+          let inspection;
+          if (!valid) {
+            // Unavailable inspection: bounded envelope, nullable fields, no raw text.
+            inspection = {
+              available: false,
+              compliant: null,
+              identity_ok: null,
+              schema_ok: null,
+              repository_linked: null,
+              items_ok: null,
+              pull_requests_ok: null,
+              next_true_up_exists: null,
+              issue_count: null,
+              noncompliant_issue_count: null,
+              pull_request_count: null,
+              noncompliant_pull_request_count: null,
+              affected_issue_refs: [],
+              affected_issue_refs_truncated: false,
+            };
+          } else {
+            const items = Array.isArray(parsed.items) ? parsed.items : [];
+            const pulls = Array.isArray(parsed.pullRequests) ? parsed.pullRequests : [];
+            const noncompliantItems = items.filter((item) => item && item.compliant === false);
+            // Only positive repository issue integers from noncompliant records.
+            const refs = noncompliantItems
+              .map((item) => item.number)
+              .filter((number) => Number.isInteger(number) && number > 0);
+            const identity = parsed.identity ?? {};
+            inspection = {
+              available: true,
+              compliant: bool(parsed.compliant),
+              identity_ok:
+                bool(identity.lawByteIdentity) &&
+                bool(identity.agentsByteIdentity) &&
+                bool(identity.payloadFilesOk) &&
+                bool(identity.runtimeByteIdentity),
+              schema_ok: bool(parsed.schema && parsed.schema.ok),
+              repository_linked: bool(parsed.repositoryLinked),
+              items_ok: bool(parsed.itemsOk),
+              pull_requests_ok: bool(parsed.pullRequestsOk),
+              next_true_up_exists: bool(parsed.nextTrueUpExists),
+              issue_count: nonNegInt(items.length),
+              noncompliant_issue_count: nonNegInt(noncompliantItems.length),
+              pull_request_count: nonNegInt(pulls.length),
+              noncompliant_pull_request_count: nonNegInt(
+                pulls.filter((pull) => pull && pull.compliant === false).length,
+              ),
+              affected_issue_refs: refs.slice(0, REFS_CAP),
+              affected_issue_refs_truncated: refs.length > REFS_CAP,
+            };
+          }
+
+          // Bounded metadata only: no repository, project, ref, sha, or actor.
+          const envelope = {
+            schema: "project-board-law-inspection-callback/v1",
+            event: process.env.GITHUB_EVENT_NAME ?? null,
+            run_id: process.env.GITHUB_RUN_ID ?? null,
+            run_attempt: process.env.GITHUB_RUN_ATTEMPT ?? null,
+            inspection,
+          };
+          writeFileSync(process.env.CALLBACK_ENVELOPE, JSON.stringify(envelope));
+          console.log(`callback envelope built available=${inspection.available}`);
+          NODE
+          INSPECT_STDOUT="$RUNNER_TEMP/inspect.stdout" \
+          INSPECT_EXIT="$inspect_exit" \
+          CALLBACK_ENVELOPE="$RUNNER_TEMP/routine-callback.json" \
+          node "$RUNNER_TEMP/build-callback.mjs"
+          build_exit=$?
+          if [ "$build_exit" -ne 0 ]; then exit "$build_exit"; fi
+          exit "$inspect_exit"
+      # Opt-in Action -> Routine callback, enabled only by the exact variable
+      # value. The two Routine secrets are scoped to this step alone. HTTPS-only,
+      # no embedded credentials, 16 KiB cap, 30s timeout, a single POST (no
+      # retry), strict success validation, and no response body reaches the logs.
+      - name: Dispatch completed inspection to Claude Routine
+        id: callback
+        if: ${{ always() && vars.PROJECT_BOARD_CLAUDE_ROUTINE == 'true' }}
+        env:
+          CLAUDE_ROUTINE_FIRE_URL: ${{ secrets.CLAUDE_ROUTINE_FIRE_URL }}
+          CLAUDE_ROUTINE_FIRE_TOKEN: ${{ secrets.CLAUDE_ROUTINE_FIRE_TOKEN }}
+          CALLBACK_ENVELOPE: ${{ runner.temp }}/routine-callback.json
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/dispatch-callback.mjs" <<'NODE'
+          import { readFileSync, writeFileSync } from "node:fs";
+
+          const MAX_TEXT_BYTES = 16 * 1024;
+          const TIMEOUT_MS = 30000;
+          const PREFIX = "<You are the primary agent in an automated workflow>";
+          const fail = (message) => { console.error(message); process.exit(1); };
+
+          const rawUrl = process.env.CLAUDE_ROUTINE_FIRE_URL ?? "";
+          const token = process.env.CLAUDE_ROUTINE_FIRE_TOKEN ?? "";
+          if (!rawUrl) fail("Claude Routine bridge enabled but the callback URL secret is missing");
+          if (!token) fail("Claude Routine bridge enabled but the callback token secret is missing");
+
+          let endpoint;
+          try { endpoint = new URL(rawUrl); } catch { fail("callback URL secret is not a valid URL"); }
+          if (endpoint.protocol !== "https:") fail("callback URL must use HTTPS");
+          if (endpoint.username || endpoint.password) fail("callback URL must not embed credentials");
+
+          let envelope;
+          try {
+            envelope = readFileSync(process.env.CALLBACK_ENVELOPE, "utf8");
+          } catch {
+            fail("callback envelope is missing");
+          }
+          const text = PREFIX + envelope;
+          if (Buffer.byteLength(text, "utf8") > MAX_TEXT_BYTES) fail("callback text exceeds the 16 KiB cap");
+          const body = JSON.stringify({ text });
+
+          let response;
+          try {
+            response = await fetch(endpoint, {
+              method: "POST",
+              redirect: "error",
+              signal: AbortSignal.timeout(TIMEOUT_MS),
+              headers: {
+                authorization: `Bearer ${token}`,
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta": "experimental-cc-routine-2026-04-01",
+                "content-type": "application/json",
+              },
+              body,
+            });
+          } catch (error) {
+            fail(`callback transport failed: ${error instanceof Error ? error.name : "error"}`);
+          }
+
+          if (response.status !== 200) fail(`callback returned HTTP ${response.status}`);
+          let result;
+          try {
+            result = await response.json();
+          } catch {
+            fail("callback response was not JSON");
+          }
+          if (
+            !result ||
+            typeof result !== "object" ||
+            result.type !== "routine_fire" ||
+            typeof result.claude_code_session_url !== "string" ||
+            result.claude_code_session_url.length === 0
+          ) {
+            fail("callback response failed success validation");
+          }
+          // Surface only the session URL, and only to the step summary.
+          const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+          if (summaryPath) {
+            writeFileSync(summaryPath, `Claude Routine session created: ${result.claude_code_session_url}\n`, { flag: "a" });
+          }
+          console.log("Claude Routine session created");
+          NODE
+          node "$RUNNER_TEMP/dispatch-callback.mjs"
+      # Restore fail-closed exit after the temporary continue-on-error above: fail
+      # on any unsuccessful inspection, and on an enabled callback that did not
+      # succeed. A disabled callback is a clear no-op, never a compliance status.
+      - name: Enforce fail-closed inspection and callback result
+        if: always()
+        env:
+          INSPECT_OUTCOME: ${{ steps.inspect.outcome }}
+          CALLBACK_OUTCOME: ${{ steps.callback.outcome }}
+          ROUTINE_ENABLED: ${{ vars.PROJECT_BOARD_CLAUDE_ROUTINE }}
+        shell: bash
+        run: |
+          if [ "$INSPECT_OUTCOME" != "success" ]; then
+            echo "inspection did not complete successfully (outcome: $INSPECT_OUTCOME)"
+            exit 1
+          fi
+          if [ "$ROUTINE_ENABLED" = "true" ] && [ "$CALLBACK_OUTCOME" != "success" ]; then
+            echo "Claude Routine callback did not succeed (outcome: $CALLBACK_OUTCOME)"
+            exit 1
+          fi
+          echo "inspection complete; callback state acceptable"
       - name: Opt-in live smoke remains read-only
         if: github.event_name == 'workflow_dispatch' && inputs.live_smoke
         env:
@@ -268,7 +561,9 @@ jobs:
     if: >-
       (github.event_name == 'schedule' && vars.PROJECT_BOARD_WRITES == 'true') ||
       (github.event_name == 'workflow_dispatch' && inputs.write_true_up && vars.PROJECT_BOARD_WRITES == 'true')
-    environment: project-board-law
+    environment:
+      name: project-board-law
+      deployment: false
     env:
       PROJECT_BOARD_PROJECT_URL: ${{ vars.PROJECT_BOARD_PROJECT_URL }}
       TRUE_UP_MILESTONE: ${{ github.event_name == 'workflow_dispatch' && inputs.milestone || vars.PROJECT_BOARD_TRUE_UP_MILESTONE }}

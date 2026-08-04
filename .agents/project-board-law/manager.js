@@ -21,8 +21,50 @@ export const API_VERSION = "2026-03-10";
 export const REST_BASE = "https://api.github.com";
 export const GRAPHQL_URL = "https://api.github.com/graphql";
 export const TOKEN_KEY = "PROJECT_CI_TOKEN";
+/**
+ * The GitHub Actions environment that scopes the PAT. It is a secret-scoping
+ * gate, not a deployment: every token-bearing job declares it with
+ * `deployment: false`, which suppresses the Deployments-UI record while leaving
+ * the environment's branch protection rules fully enforced (verified 2026-08-03).
+ * `inspect` audits the environment's posture via `checkEnvironmentPosture`.
+ */
+export const DEPLOY_ENVIRONMENT = "project-board-law";
 export const ENV_FILE = ".agents/project-ci.env";
 export const JOURNAL_PATH = ".agents/project-board-law/journal.ndjson";
+/**
+ * Every secret name the pack provisions and requires to live ONLY on the
+ * `project-board-law` environment (the Routine secrets). Any copy of one of these
+ * at repository OR organization scope resolves in a token-bearing job regardless
+ * of the environment and defeats the default-branch gate, so `inspect` sweeps all
+ * applicable scopes for each. `PROJECT_CI_TOKEN` is the PAT; the two
+ * `CLAUDE_ROUTINE_FIRE_*` values back the opt-in Routine callback bridge and are
+ * likewise environment-scoped (see INSTALL.md).
+ */
+export const ROUTINE_SECRETS = [
+    TOKEN_KEY,
+    "CLAUDE_ROUTINE_FIRE_URL",
+    "CLAUDE_ROUTINE_FIRE_TOKEN",
+];
+/**
+ * The canonical GitHub Actions secret-name grammar: a leading letter or
+ * underscore followed by letters, digits, or underscores. Names are matched
+ * case-insensitively by GitHub, so the audit canonicalizes every observed name
+ * to uppercase before comparing. A name that does not match this pattern (empty,
+ * whitespace-only, whitespace-padded, digit-leading, or otherwise garbage) is not
+ * a real secret name and must fail closed rather than pad a total_count.
+ */
+export const SECRET_NAME_SYNTAX = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/**
+ * The two exact status-check contexts that must gate the default branch. Both
+ * must appear among the effective required status checks (branch protection AND
+ * rulesets, unioned). Missing either — or protection that cannot be read — is a
+ * distinct fail-closed violation. `identity` is the secretless job; `live-board`
+ * is the base-controlled privileged job.
+ */
+export const REQUIRED_STATUS_CHECK_CONTEXTS = [
+    "Project Board Law / identity",
+    "project-board-law/live-board",
+];
 export const BLOCK_BEGIN = "<!-- PROJECT-BOARD-LAW:BEGIN -->";
 export const BLOCK_END = "<!-- PROJECT-BOARD-LAW:END -->";
 export const APPROVED = "Approved";
@@ -37,6 +79,29 @@ export const COMMANDS = [
     "true-up",
     "milestone",
 ];
+/**
+ * Every option a command consumes, beyond the global --repo/--project/--dry-run.
+ * main() rejects any supplied option outside its command's set so that no
+ * option — least of all a confirmation — is ever silently ignored.
+ */
+const GLOBAL_OPTIONS = new Set(["repo", "project", "dry-run"]);
+const COMMAND_OPTIONS = {
+    inspect: new Set(),
+    reconcile: new Set(["iteration-start", "iteration-days"]),
+    install: new Set([
+        "milestone", "true-up-milestone", "iteration",
+        "iteration-start", "iteration-days", "replace-true-up-body",
+    ]),
+    item: new Set([
+        "issue", "title", "confirm", "reset", "status", "priority", "size",
+        "estimate", "iteration", "iteration-start", "iteration-days", "parent",
+        "blocked-by", "label", "assignee", "milestone", "body",
+    ]),
+    status: new Set(["issue", "value", "reset"]),
+    hr: new Set(["issue", "mode", "request", "reset"]),
+    "true-up": new Set(["milestone", "iteration"]),
+    milestone: new Set(["name", "due"]),
+};
 /** Additive schema the manager guarantees. Options/extras are preserved. */
 export const REQUIRED_SCHEMA = [
     { name: "Status", dataType: "SINGLE_SELECT", options: [IN_REVIEW, APPROVED] },
@@ -138,6 +203,21 @@ export function nullableOpt(opts, key) {
     const v = firstOpt(opts, key);
     return v && v !== "true" ? v : null;
 }
+/**
+ * A confirmation-class option carries destructive or override intent and may be
+ * supplied at most once; conflicting repeated values fail closed rather than
+ * silently resolving to either one.
+ */
+export function singleOpt(opts, key) {
+    if (allOpts(opts, key).some((value) => value === "true")) {
+        throw new ManagerError("confirmation", `--${key} requires a value`);
+    }
+    const values = realOpts(opts, key);
+    if (values.length > 1) {
+        throw new ManagerError("confirmation", `--${key} may be supplied at most once; received ${values.length} conflicting values`);
+    }
+    return values.length === 1 ? values[0] : null;
+}
 const REPO_RE = /^https:\/\/github\.com\/([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)$/;
 /** Strict canonical `https://github.com/OWNER/REPO` with no suffix or slash. */
 export function parseRepoUrl(value) {
@@ -202,6 +282,61 @@ export function splitConfirmation(value) {
     if (!m)
         return null;
     return { kind: m[1], issue: Number.parseInt(m[2], 10) };
+}
+/**
+ * Normalize an issue title into a set of word tokens for deterministic
+ * near-duplicate detection: uppercase, every run of non-alphanumeric characters
+ * becomes a single space, surrounding whitespace is trimmed, and the remaining
+ * words form a set. Locale-independent (Unicode letter/number classes), so it is
+ * stable across platforms and depends only on the title bytes.
+ */
+export function normalizeTitleTokens(title) {
+    return new Set(title
+        .toUpperCase()
+        .replace(/[^\p{L}\p{N}]+/gu, " ")
+        .trim()
+        .split(/\s+/)
+        .filter((token) => token.length > 0));
+}
+/** True when `inner` is non-empty and every one of its tokens is in `outer`. */
+function tokenSetContains(inner, outer) {
+    if (inner.size === 0)
+        return false;
+    for (const token of inner)
+        if (!outer.has(token))
+            return false;
+    return true;
+}
+/**
+ * Deterministic near-duplicate detection: given a proposed issue title and a set
+ * of open issues, return those whose normalized token set has Jaccard overlap
+ * >= 0.5 with the proposal, OR where one token set fully contains the other.
+ * Wording-level differences (case, punctuation, filler words, reordering) thus
+ * surface as the same Work. Results are ordered most-similar first, then by issue
+ * number, so the caller can present a bounded, stable list.
+ */
+export function duplicateIssueCandidates(proposedTitle, openIssues) {
+    const proposed = normalizeTitleTokens(proposedTitle);
+    if (proposed.size === 0)
+        return [];
+    const scored = [];
+    for (const issue of openIssues) {
+        const other = normalizeTitleTokens(issue.title);
+        if (other.size === 0)
+            continue;
+        let intersection = 0;
+        for (const token of proposed)
+            if (other.has(token))
+                intersection += 1;
+        const union = proposed.size + other.size - intersection;
+        const jaccard = union === 0 ? 0 : intersection / union;
+        const contained = tokenSetContains(proposed, other) || tokenSetContains(other, proposed);
+        if (jaccard >= 0.5 || contained) {
+            scored.push({ number: issue.number, title: issue.title, score: contained ? 1 : jaccard });
+        }
+    }
+    scored.sort((a, b) => b.score - a.score || a.number - b.number);
+    return scored.map(({ number, title }) => ({ number, title }));
 }
 // --------------------------------------------------------------------------
 // Identity: SHA-256, managed AGENTS block
@@ -293,6 +428,23 @@ export function agentsBlockMatches(existing, lawText) {
     if (existing === null)
         return false;
     return existing.startsWith(buildManagedBlock(lawText));
+}
+/**
+ * Decode an existing AGENTS.md as text for managed-block planning, refusing to
+ * proceed when the bytes are not round-trippable UTF-8.
+ *
+ * `planAgentsContent` preserves the file's unmanaged bytes by slicing them as a
+ * UTF-8 string and rewriting them via `Buffer.from(text, "utf8")`. Invalid or
+ * non-round-tripping bytes decode to U+FFFD and would be silently normalized on
+ * write, corrupting user-owned content outside the managed block. Reject them at
+ * the trust boundary (fail closed) instead of normalizing them away.
+ */
+export function decodeAgentsText(buf) {
+    const text = buf.toString("utf8");
+    if (!Buffer.from(text, "utf8").equals(buf)) {
+        throw new ManagerError("malformed-agents", "AGENTS.md is not round-trippable UTF-8; refusing to normalize unmanaged bytes");
+    }
+    return text;
 }
 // --------------------------------------------------------------------------
 // OAuth scope verification
@@ -611,6 +763,60 @@ export class GitHubClient {
             throw new ManagerError("rest-error", `REST ${method} ${path} -> ${res.status}: ${messageOf(json) ?? res.status}`);
         }
         return { status: res.status, headers: res.headers, json, body: res.body };
+    }
+    /**
+     * GET that resolves a 404 to `null` instead of throwing, for existence probes
+     * (an environment or a secret that may legitimately be absent). Every other
+     * >= 400 status still fails closed exactly like `rest`. GET is idempotent, so
+     * the underlying request retries rate/5xx signals like any other read.
+     */
+    async restOptional(path) {
+        const url = path.startsWith("http") ? path : `${REST_BASE}${path}`;
+        const res = await this.request({ method: "GET", url, headers: this.baseHeaders() }, true);
+        if (res.status === 404)
+            return null;
+        let json = null;
+        if (res.body.length > 0) {
+            try {
+                json = JSON.parse(res.body);
+            }
+            catch {
+                json = null;
+            }
+        }
+        if (res.status >= 400) {
+            throw new ManagerError("rest-error", `REST GET ${path} -> ${res.status}: ${messageOf(json) ?? res.status}`);
+        }
+        return { status: res.status, headers: res.headers, json, body: res.body };
+    }
+    /**
+     * GET that classifies a scope probe by status instead of throwing. Returns the
+     * status for EXACTLY 200 (present/readable), 403 (permission-denied — the scope
+     * cannot be verified, so the caller fails closed), and 404 (definitively absent).
+     * EVERY other status — including a 2xx that is not 200 (e.g. 204) and any 3xx
+     * (an unfollowed redirect) as well as every >= 400 — fails closed exactly like
+     * `rest`, because a probe caller treats "not 200/403/404" as clean and an
+     * unexpected status must never be silently classified that way. GET is
+     * idempotent, so a rate-limited 403 is retried underneath
+     * (`request`/`shouldRetryStatus`) and only a terminal permission 403 reaches the
+     * caller.
+     */
+    async restProbe(path) {
+        const url = path.startsWith("http") ? path : `${REST_BASE}${path}`;
+        const res = await this.request({ method: "GET", url, headers: this.baseHeaders() }, true);
+        let json = null;
+        if (res.body.length > 0) {
+            try {
+                json = JSON.parse(res.body);
+            }
+            catch {
+                json = null;
+            }
+        }
+        if (res.status === 200 || res.status === 403 || res.status === 404) {
+            return { status: res.status, json };
+        }
+        throw new ManagerError("rest-error", `REST GET ${path} -> ${res.status}: ${messageOf(json) ?? res.status}`);
     }
     /** GET every page of an array endpoint, following RFC 5988 Link rel=next. */
     async restPaginate(path) {
@@ -1385,7 +1591,8 @@ async function verifyAccess(ctx, write) {
     if (!check.ok) {
         throw new ManagerError("scope", check.reason ?? "unverifiable scopes");
     }
-    return { repoPrivate, repoNodeId: repoJson.node_id, scopes };
+    const defaultBranch = typeof repoJson.default_branch === "string" ? repoJson.default_branch : "";
+    return { repoPrivate, repoNodeId: repoJson.node_id, scopes, defaultBranch };
 }
 function refuseApproved(status) {
     if (status === APPROVED) {
@@ -1652,10 +1859,772 @@ function decodePayload(target) {
     return Buffer.from(encoded, "base64");
 }
 // --------------------------------------------------------------------------
+// Customizable installation guide: deterministic, fail-closed three-way merge
+//
+// `.agents/project-board-law/INSTALL.md` is the SOLE installed artifact a
+// governed repository may customize; every other vendored artifact stays
+// byte-identical to its embedded payload. On upgrade the manager reconciles
+// three inputs with a deterministic line merge that fails closed before any
+// write:
+//   base   — the prior upstream default, read as DATA from the already-installed
+//            generated payload artifact (never imported or executed) and trusted
+//            only after that artifact's own manifest digest verifies it;
+//   ours   — the on-disk target customization;
+//   theirs — the incoming vendored default.
+// Identical or disjoint line edits merge; an overlapping incompatible edit, an
+// absent/unverifiable prior default, or ambiguous newline/encoding fails closed
+// so neither the customization nor an incoming security/functionality change is
+// ever silently dropped. The prior-default bytes only influence a documentation
+// merge and are never executed, so a forged artifact cannot escalate privilege.
+// --------------------------------------------------------------------------
+/** The one installed artifact a governed repository may customize. */
+export const CUSTOMIZABLE_INSTALL = ".agents/project-board-law/INSTALL.md";
+/** Decode installation-guide bytes, rejecting a BOM, non-UTF-8, and mixed EOLs. */
+export function analyzeInstallText(buf) {
+    if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
+        return { ok: false, error: "a UTF-8 BOM" };
+    }
+    const text = buf.toString("utf8");
+    if (!Buffer.from(text, "utf8").equals(buf)) {
+        return { ok: false, error: "invalid UTF-8" };
+    }
+    if (text.includes("\r")) {
+        const crlf = (text.match(/\r\n/g) ?? []).length;
+        const cr = (text.match(/\r/g) ?? []).length;
+        const lf = (text.match(/\n/g) ?? []).length;
+        if (cr !== crlf || lf !== crlf)
+            return { ok: false, error: "mixed newlines" };
+        return { ok: true, text, newline: "\r\n", finalNewline: text.endsWith("\r\n") };
+    }
+    return { ok: true, text, newline: "\n", finalNewline: text.endsWith("\n") };
+}
+/** Split into lines for the shared newline; a final newline is tracked apart. */
+function splitInstallLines(text, nl) {
+    if (text.length === 0)
+        return [];
+    const parts = text.split(nl);
+    if (parts.length > 0 && parts[parts.length - 1] === "")
+        parts.pop();
+    return parts;
+}
+/** Deterministic LCS-aligned matching index pairs between two line arrays. */
+function lcsPairs(a, b) {
+    const n = a.length;
+    const m = b.length;
+    const dp = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+    for (let i = n - 1; i >= 0; i--) {
+        const row = dp[i];
+        const next = dp[i + 1];
+        for (let j = m - 1; j >= 0; j--) {
+            row[j] = a[i] === b[j] ? next[j + 1] + 1 : Math.max(next[j], row[j + 1]);
+        }
+    }
+    const pairs = [];
+    let i = 0;
+    let j = 0;
+    while (i < n && j < m) {
+        if (a[i] === b[j]) {
+            pairs.push([i, j]);
+            i++;
+            j++;
+        }
+        else if (dp[i + 1][j] >= dp[i][j + 1]) {
+            i++;
+        }
+        else {
+            j++;
+        }
+    }
+    return pairs;
+}
+/** Differing regions between base (o) and one side (s), from an LCS alignment. */
+function diffRegions(o, s) {
+    const pairs = lcsPairs(o, s);
+    pairs.push([o.length, s.length]); // sentinel closes the trailing region
+    const regions = [];
+    let oi = 0;
+    let si = 0;
+    for (const [om, sm] of pairs) {
+        if (om - oi > 0 || sm - si > 0) {
+            regions.push({ oStart: oi, oLen: om - oi, sStart: si, sLen: sm - si });
+        }
+        oi = om + 1;
+        si = sm + 1;
+    }
+    return regions;
+}
+/** Reconstruct one side's lines for a base region bounded by unchanged lines. */
+function reconstructSide(sideArr, group, side, rs, re) {
+    const mine = group.filter((h) => h.side === side).sort((x, y) => x.oStart - y.oStart);
+    if (mine.length === 0)
+        return [];
+    const first = mine[0];
+    const last = mine[mine.length - 1];
+    const start = first.sStart - (first.oStart - rs);
+    const end = last.sStart + last.sLen + (re - last.oEnd);
+    return sideArr.slice(start, end);
+}
+/**
+ * Line-based three-way merge. Regions changed on a single side are taken as-is;
+ * strictly overlapping edits from both sides resolve only when identical and
+ * otherwise fail closed. Disjoint and adjacent edits both merge cleanly.
+ */
+function diff3Merge(base, ours, theirs) {
+    const hunks = [];
+    for (const r of diffRegions(base, ours)) {
+        hunks.push({ side: 0, oStart: r.oStart, oEnd: r.oStart + r.oLen, sStart: r.sStart, sLen: r.sLen });
+    }
+    for (const r of diffRegions(base, theirs)) {
+        hunks.push({ side: 1, oStart: r.oStart, oEnd: r.oStart + r.oLen, sStart: r.sStart, sLen: r.sLen });
+    }
+    hunks.sort((x, y) => x.oStart - y.oStart || x.oEnd - y.oEnd || x.side - y.side);
+    const out = [];
+    let oPos = 0;
+    const emitBase = (until) => {
+        for (let k = oPos; k < until; k++)
+            out.push(base[k]);
+        if (until > oPos)
+            oPos = until;
+    };
+    let i = 0;
+    while (i < hunks.length) {
+        const head = hunks[i];
+        let rs = head.oStart;
+        let re = head.oEnd;
+        const group = [head];
+        i++;
+        // Group STRICTLY overlapping hunks; adjacent (touching) edits stay
+        // independent so disjoint changes merge instead of colliding. One exception:
+        // pure insertions (zero-length base region) at the SAME base anchor never
+        // strictly overlap, yet they compete for the same gap. Group them so an
+        // identical insertion from both sides is emitted once and a divergent one
+        // fails closed, instead of concatenating both silently.
+        while (i < hunks.length) {
+            const next = hunks[i];
+            const overlaps = next.oStart < re;
+            const sameAnchorInsert = re === rs && next.oStart === rs && next.oEnd === next.oStart;
+            if (!overlaps && !sameAnchorInsert)
+                break;
+            re = Math.max(re, next.oEnd);
+            group.push(next);
+            i++;
+        }
+        emitBase(rs);
+        const sides = new Set(group.map((h) => h.side));
+        if (sides.size === 1) {
+            const side = group[0].side;
+            out.push(...reconstructSide(side === 0 ? ours : theirs, group, side, rs, re));
+        }
+        else {
+            const ourSlice = reconstructSide(ours, group, 0, rs, re);
+            const theirSlice = reconstructSide(theirs, group, 1, rs, re);
+            if (ourSlice.length === theirSlice.length && ourSlice.every((l, k) => l === theirSlice[k])) {
+                out.push(...ourSlice);
+            }
+            else {
+                return {
+                    ok: false,
+                    reason: `overlapping incompatible edit near line ${rs + 1} of the prior installation guide`,
+                };
+            }
+        }
+        oPos = Math.max(oPos, re);
+    }
+    emitBase(base.length);
+    return { ok: true, lines: out };
+}
+/**
+ * Three-way merge of the installation guide. Every input must be BOM-free
+ * UTF-8 sharing one newline style and trailing-newline state; any ambiguity
+ * fails closed.
+ */
+export function threeWayMergeInstall(base, ours, theirs) {
+    const b = analyzeInstallText(base);
+    const o = analyzeInstallText(ours);
+    const t = analyzeInstallText(theirs);
+    if (!b.ok)
+        return { ok: false, reason: `prior default is ${b.error}` };
+    if (!o.ok)
+        return { ok: false, reason: `target customization is ${o.error}` };
+    if (!t.ok)
+        return { ok: false, reason: `incoming default is ${t.error}` };
+    if (b.newline !== o.newline || b.newline !== t.newline) {
+        return { ok: false, reason: "ambiguous newline style across prior, customized, and incoming installation guide" };
+    }
+    if (b.finalNewline !== o.finalNewline || b.finalNewline !== t.finalNewline) {
+        return { ok: false, reason: "ambiguous trailing newline across prior, customized, and incoming installation guide" };
+    }
+    const nl = b.newline;
+    const merged = diff3Merge(splitInstallLines(b.text, nl), splitInstallLines(o.text, nl), splitInstallLines(t.text, nl));
+    if (!merged.ok)
+        return { ok: false, reason: merged.reason };
+    let text = merged.lines.join(nl);
+    if (b.finalNewline && merged.lines.length > 0)
+        text += nl;
+    return { ok: true, content: Buffer.from(text, "utf8") };
+}
+/**
+ * Whole-file canonical form the generator emits: the fixed header comment, the
+ * five `export const` declarations in exact order, and the `PAYLOADS` object.
+ * The artifact is consumed as DATA (never imported, never executed), yet only
+ * this exact wrapper is accepted. Anchoring start-to-end means no prefix,
+ * suffix, second statement, or executable trailer can ride alongside a
+ * legitimate-looking payload set; the sole optional trailing byte is one final
+ * newline. `PAYLOAD_SHA256` and the entries block are the only variable capture
+ * groups.
+ */
+const GENERATED_WRAPPER = /^\/\/ Generated by scripts\/generate-payload\.mjs; do not edit\.\nexport const LAW_SHA256 = "[0-9a-f]{64}";\nexport const PAYLOAD_SHA256 = "([0-9a-f]{64})";\nexport const RUNTIME_MANAGER_SHA256 = "[0-9a-f]{64}";\nexport const RUNTIME_PACKAGE_JSON = "(?:[^"\\]|\\.)*";\nexport const PAYLOADS = \{\n([\s\S]*)\n\};\n?$/;
+/** One `  "target": ["aaa", ...].join("")` line, optional trailing comma. */
+const GENERATED_ENTRY = /^ {4}("(?:[^"\\]|\\.)*"): (\["(?:[^"\\]|\\.)*"(?:, ?"(?:[^"\\]|\\.)*")*\])\.join\(""\)(,?)$/;
+/**
+ * Parse a generated payload artifact as DATA (never executed). It must be the
+ * ENTIRE canonical generated wrapper — nothing before the header, nothing after
+ * the closing `};` but one optional newline. Every entry reproduces the
+ * generator's `"target": ["aaa", ...].join("")` shape; each decoded payload must
+ * be canonical, round-tripping base64. Any prefix, suffix, extra statement,
+ * executable trailer, stray carriage return, ambiguous or malformed escaping, or
+ * non-round-tripping encoding fails closed. Used only to recover the prior
+ * installation-guide default and to bind the vendored source identity.
+ */
+export function parseGeneratedPayloadArtifact(src) {
+    // A carriage return would make newline handling ambiguous; the generated form
+    // is strictly LF, so any CR marks a non-canonical artifact.
+    if (src.includes("\r"))
+        return { ok: false, error: "a non-LF (carriage-return) byte" };
+    const wrapper = GENERATED_WRAPPER.exec(src);
+    if (!wrapper)
+        return { ok: false, error: "a non-canonical generated wrapper" };
+    const payloadSha256 = wrapper[1];
+    const body = wrapper[2];
+    const lines = body.split("\n");
+    const payloads = new Map();
+    for (let i = 0; i < lines.length; i++) {
+        const entry = GENERATED_ENTRY.exec(lines[i]);
+        if (!entry)
+            return { ok: false, error: "a malformed PAYLOADS entry" };
+        // Every entry but the last carries a trailing comma; a missing interior
+        // comma would mean a truncated or spliced object body.
+        if (entry[3] !== "," && i !== lines.length - 1) {
+            return { ok: false, error: "a PAYLOADS entry missing its separator" };
+        }
+        let key;
+        let pieces;
+        try {
+            key = JSON.parse(entry[1]);
+            pieces = JSON.parse(entry[2]);
+        }
+        catch {
+            return { ok: false, error: "a malformed PAYLOADS entry" };
+        }
+        if (typeof key !== "string" || JSON.stringify(key) !== entry[1]) {
+            return { ok: false, error: "a non-canonical PAYLOADS key" };
+        }
+        if (payloads.has(key))
+            return { ok: false, error: "a duplicate PAYLOADS key" };
+        if (!Array.isArray(pieces) || pieces.length === 0 || !pieces.every((p) => typeof p === "string")) {
+            return { ok: false, error: "malformed PAYLOADS base64 pieces" };
+        }
+        const encoded = pieces.join("");
+        if (!/^[A-Za-z0-9+/]*={0,2}$/.test(encoded) || encoded.length % 4 !== 0) {
+            return { ok: false, error: "a non-base64 PAYLOADS payload" };
+        }
+        const bytes = Buffer.from(encoded, "base64");
+        if (bytes.toString("base64") !== encoded) {
+            return { ok: false, error: "a non-round-tripping PAYLOADS payload" };
+        }
+        payloads.set(key, bytes);
+    }
+    if (payloads.size === 0)
+        return { ok: false, error: "no PAYLOADS entries" };
+    return { ok: true, artifact: { payloadSha256, payloads } };
+}
+/** Recompute the payload manifest digest exactly as the generator emits it. */
+function payloadManifestHash(payloads) {
+    const manifest = Buffer.from([...payloads.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([target, bytes]) => `${target}\0${sha256Hex(bytes)}\0`)
+        .join(""));
+    return sha256Hex(manifest);
+}
+/**
+ * Bind the runtime payload source (the sibling `payload.generated.js` about to be
+ * vendored) to the EXACT payload identity imported at module load. `PAYLOADS`,
+ * `PAYLOAD_SHA256`, and every artifact derived from them — including the resolved
+ * INSTALL guide and the other vendored payload files — are frozen when this module
+ * is imported, but the source file itself is read from disk only during apply.
+ * If that later read differs in its payload set from the imported identity (e.g.
+ * the file was swapped between module import and this read), accepting its bytes
+ * as the planned source snapshot would copy a source inconsistent with the
+ * payloads written beside it while the prewrite guard — which only pins that same
+ * later read — passes. Verify against the module-load `PAYLOAD_SHA256` and fail
+ * closed so no such divergent source can ever be accepted as the planned snapshot.
+ */
+function verifyRuntimePayloadSourceIdentity(bytes) {
+    const parsed = parseGeneratedPayloadArtifact(bytes.toString("utf8"));
+    if (!parsed.ok)
+        return { ok: false, reason: `runtime payload source has ${parsed.error}` };
+    if (parsed.artifact.payloadSha256 !== PAYLOAD_SHA256) {
+        return {
+            ok: false,
+            reason: "runtime payload source declares a payload identity that differs from the imported PAYLOAD_SHA256",
+        };
+    }
+    if (payloadManifestHash(parsed.artifact.payloads) !== PAYLOAD_SHA256) {
+        return {
+            ok: false,
+            reason: "runtime payload source payloads differ from the imported payload identity",
+        };
+    }
+    return { ok: true };
+}
+/**
+ * Recover the prior installation-guide default from the already-installed
+ * generated payload, trusting it only after its own manifest digest verifies.
+ * Never imports or executes the artifact.
+ */
+function readPriorInstallDefault(fs, cwd) {
+    const path = join(cwd, RUNTIME_PAYLOAD);
+    if (!fs.existsSync(path)) {
+        return { ok: false, reason: "installed generated payload is absent" };
+    }
+    let sourceBytes;
+    try {
+        sourceBytes = fs.readFileSync(path);
+    }
+    catch (err) {
+        return { ok: false, reason: `installed generated payload is unreadable: ${errText(err)}` };
+    }
+    const parsed = parseGeneratedPayloadArtifact(sourceBytes.toString("utf8"));
+    if (!parsed.ok)
+        return { ok: false, reason: `installed generated payload has ${parsed.error}` };
+    if (payloadManifestHash(parsed.artifact.payloads) !== parsed.artifact.payloadSha256) {
+        return { ok: false, reason: "installed generated payload failed its own manifest digest" };
+    }
+    const base = parsed.artifact.payloads.get(CUSTOMIZABLE_INSTALL);
+    if (!base)
+        return { ok: false, reason: "installed generated payload lacks the installation-guide entry" };
+    // Return the exact raw artifact bytes consumed to derive `base` so the install
+    // pre-write guard can pin them without a second, race-prone read.
+    return { ok: true, base, sourceBytes };
+}
+/**
+ * Resolve the installation-guide bytes to write. Initial install writes the
+ * incoming default; an uncustomized target adopts it; a customized target is
+ * three-way merged against the identity-verified prior default. Any unsafe or
+ * ambiguous state fails closed.
+ */
+export function resolveInstallCustomization(fs, cwd, incomingDefault) {
+    const target = join(cwd, CUSTOMIZABLE_INSTALL);
+    const ours = fs.existsSync(target) ? fs.readFileSync(target) : null;
+    const targetSha256 = ours === null ? null : sha256Hex(ours);
+    if (ours === null) {
+        return { ok: true, content: incomingDefault, mode: "initial", targetSha256, priorSourceSha256: null };
+    }
+    if (ours.equals(incomingDefault)) {
+        return { ok: true, content: incomingDefault, mode: "current", targetSha256, priorSourceSha256: null };
+    }
+    const prior = readPriorInstallDefault(fs, cwd);
+    if (!prior.ok) {
+        return { ok: false, reason: `cannot obtain the prior installation-guide default: ${prior.reason}` };
+    }
+    // Fingerprint the EXACT artifact bytes the merge base was derived from, so the
+    // pre-write guard pins that same read — never a second one that could race.
+    const priorSourceSha256 = sha256Hex(prior.sourceBytes);
+    if (ours.equals(prior.base)) {
+        return { ok: true, content: incomingDefault, mode: "adopt-default", targetSha256, priorSourceSha256 };
+    }
+    const merged = threeWayMergeInstall(prior.base, ours, incomingDefault);
+    if (!merged.ok)
+        return { ok: false, reason: merged.reason };
+    return { ok: true, content: merged.content, mode: "merged", targetSha256, priorSourceSha256 };
+}
+/** Plan-visible summary of an installation-guide resolution (secret-free). */
+function publicInstallResolution(res) {
+    return res.ok
+        ? { path: CUSTOMIZABLE_INSTALL, action: res.mode }
+        : { path: CUSTOMIZABLE_INSTALL, blocked: res.reason };
+}
+/**
+ * A deployment-branch-policy name that would let a pull-request ref reach the
+ * environment. Any of these patterns defeats the "default branch only" gate,
+ * because a pull request's controlled head/merge ref could then deploy and
+ * receive the PAT. Matches `refs/pull/` prefixes (including the `/merge` ref),
+ * a bare `pull/<n>` segment, and any name ending in `/merge`.
+ */
+export function isPullRefPattern(name) {
+    const n = name.trim();
+    return /(^|\/)pull\//.test(n) || /refs\/pull/.test(n) || /\/merge$/.test(n);
+}
+/**
+ * Audit the secret-scoping environment posture from the token-bearing inspect
+ * path (identity is deliberately secretless and never runs this). Every check is
+ * evaluated and every failure is reported — the caller sees ALL violations, not
+ * just the first. Absence is proven with 404-tolerant probes so a missing
+ * environment or secret is a clear finding rather than a thrown error.
+ */
+export async function checkEnvironmentPosture(ctx, defaultBranch) {
+    const env = DEPLOY_ENVIRONMENT;
+    const nwo = ctx.repo.nwo;
+    const violations = [];
+    // (a) The environment must exist. If created on first use it carries no
+    // protection rules, which defeats the gate, so absence is fail-closed.
+    const envRes = await ctx.client.restOptional(`/repos/${nwo}/environments/${env}`);
+    if (envRes === null) {
+        violations.push({
+            check: "environment-missing",
+            message: `environment "${env}" does not exist; create it and scope ${TOKEN_KEY} to it before any token-bearing run`,
+        });
+    }
+    else {
+        const envJson = (envRes.json ?? {});
+        const dbp = envJson.deployment_branch_policy ?? null;
+        // (b.1) The policy must be CUSTOM (custom_branch_policies), never the
+        // protected-branches preset, so exactly one named branch can be pinned.
+        if (!dbp || dbp.custom_branch_policies !== true || dbp.protected_branches === true) {
+            violations.push({
+                check: "branch-policy-not-custom",
+                message: `environment "${env}" must use a custom deployment branch policy (custom_branch_policies=true, protected_branches=false)`,
+            });
+        }
+        // (b.2)+(c) Enumerate the custom branch policies once and audit them.
+        const policyRes = await ctx.client.restOptional(`/repos/${nwo}/environments/${env}/deployment-branch-policies`);
+        const policyJson = (policyRes?.json ?? {});
+        const policies = Array.isArray(policyJson.branch_policies) ? policyJson.branch_policies : [];
+        const names = policies.map((p) => (typeof p.name === "string" ? p.name : ""));
+        // (c) No policy may match a pull-request ref pattern.
+        const pullRefNames = names.filter((name) => name.length > 0 && isPullRefPattern(name));
+        if (pullRefNames.length > 0) {
+            violations.push({
+                check: "branch-policy-pull-ref",
+                message: `environment "${env}" has deployment branch policies matching pull-request refs (${pullRefNames.join(", ")}); a pull request could then deploy and receive ${TOKEN_KEY}`,
+            });
+        }
+        // (b.2) Exactly one branch-type policy, equal to the repository default branch.
+        const branchPolicies = policies.filter((p) => p.type === "branch");
+        const defaultOnly = policies.length === 1 &&
+            branchPolicies.length === 1 &&
+            defaultBranch.length > 0 &&
+            branchPolicies[0]?.name === defaultBranch;
+        if (!defaultOnly) {
+            const seen = names.length > 0 ? names.join(", ") : "none";
+            violations.push({
+                check: "branch-policy-default-only",
+                message: `environment "${env}" must permit exactly one branch policy equal to the default branch "${defaultBranch || "(unknown)"}"; found: ${seen}`,
+            });
+        }
+        // (e) No custom GitHub App deployment protection rules: they are INCOMPATIBLE
+        // with `deployment: false` and would make every token-bearing job fail
+        // immediately (per GitHub docs). Only native branch policies are permitted.
+        const ruleRes = await ctx.client.restOptional(`/repos/${nwo}/environments/${env}/deployment-protection-rules`);
+        const ruleJson = (ruleRes?.json ?? {});
+        const customRules = Array.isArray(ruleJson.custom_deployment_protection_rules)
+            ? ruleJson.custom_deployment_protection_rules
+            : [];
+        if (customRules.length > 0) {
+            violations.push({
+                check: "deployment-protection-rules-incompatible",
+                message: `environment "${env}" has ${customRules.length} custom GitHub App deployment protection rule(s); these are incompatible with "deployment: false" and would make every token-bearing job fail immediately — remove them and rely on the native branch policy`,
+            });
+        }
+    }
+    // (d) No copy of ANY provisioned secret outside the environment. Every Routine
+    // secret must live ONLY on the "${env}" environment; a repository-scope OR an
+    // organization-scope copy resolves in the token-bearing job regardless of the
+    // environment and silently defeats the gate. Sweep every applicable scope for
+    // every name, and FAIL CLOSED (distinct "scope-unverifiable" finding) on any
+    // scope that cannot be read. Checked whether or not the environment exists.
+    violations.push(...(await auditSecretScopes(ctx, env)));
+    return { environment: env, ok: violations.length === 0, violations };
+}
+/**
+ * Audit every scope from which a token-bearing job could resolve a provisioned
+ * secret: per-name REPOSITORY secrets, and the ORGANIZATION secrets visible to
+ * the repository (when it belongs to an org). Any present copy of a Routine
+ * secret is a distinct violation; any scope that returns 403 is a distinct
+ * fail-closed "scope-unverifiable" finding — a scope is never silently treated as
+ * clean. The organization listing is paginated to completion and its shape is
+ * validated: a prohibited secret on a later page must not be missed, and a
+ * malformed or incomplete 200 body is fail-closed, not empty=clean. A 404 on the
+ * org-secrets endpoint means org scope is not applicable ONLY when the repository
+ * is user-owned; for an organization-owned repository (or an owner whose type
+ * cannot be read) a 404 is itself fail-closed.
+ */
+export async function auditSecretScopes(ctx, env) {
+    const nwo = ctx.repo.nwo;
+    const violations = [];
+    // Repository scope, one probe per provisioned name.
+    for (const name of ROUTINE_SECRETS) {
+        const probe = await ctx.client.restProbe(`/repos/${nwo}/actions/secrets/${name}`);
+        if (probe.status === 200) {
+            violations.push({
+                check: "repo-scope-secret",
+                message: `a repository-scope secret named ${name} exists; it resolves regardless of the environment and defeats the gate — delete it and store ${name} in the "${env}" environment only`,
+            });
+        }
+        else if (probe.status === 403) {
+            violations.push({
+                check: "secret-scope-unverifiable",
+                message: `repository-scope secret "${name}" for ${nwo} could not be verified (HTTP 403); grant the token repository "Secrets" read (a fine-grained PAT with the Secrets:read permission, or a classic token with repo scope) so inspect can prove no unscoped copy exists — failing closed`,
+            });
+        }
+        // 404 => absent at repository scope => compliant for this name.
+    }
+    // Organization scope: the org secrets shared with (visible to) this repository.
+    // Paginate to completion and validate the response shape. A Routine secret on
+    // ANY page defeats the gate even if repository scope is clean, so a single
+    // unpaginated read could silently miss a copy on page 2+; a malformed or partial
+    // 200 body must fail closed rather than read as empty=clean.
+    const PER_PAGE = 100;
+    const orgNames = new Set();
+    let orgStatus = 0;
+    let totalCount = 0;
+    let accumulated = 0;
+    let shapeInvalid = false;
+    // A non-200 is a legitimate "org scope does not apply" signal ONLY on the very
+    // first request, before any page has been read. Once a 200 page has been
+    // collected, pagination is underway; a later non-200 truncates the listing and
+    // we can no longer prove completeness, so it is unverifiable, NOT the
+    // user-owned-repo n/a case. Track whether a 200 page has been seen.
+    let sawOkPage = false;
+    for (let page = 1;; page += 1) {
+        const orgProbe = await ctx.client.restProbe(`/repos/${nwo}/actions/organization-secrets?per_page=${PER_PAGE}&page=${page}`);
+        orgStatus = orgProbe.status;
+        if (orgProbe.status !== 200)
+            break;
+        sawOkPage = true;
+        const body = (orgProbe.json ?? null);
+        const pageSecrets = body && Array.isArray(body.secrets) ? body.secrets : null;
+        const pageTotal = body &&
+            typeof body.total_count === "number" &&
+            Number.isInteger(body.total_count) &&
+            body.total_count >= 0
+            ? body.total_count
+            : null;
+        if (pageSecrets === null || pageTotal === null) {
+            // Non-array secrets, or a total_count that is not a nonnegative integer =>
+            // unverifiable.
+            shapeInvalid = true;
+            break;
+        }
+        if (page === 1) {
+            totalCount = pageTotal;
+        }
+        else if (pageTotal !== totalCount) {
+            // total_count must be stable across pages; drift means it cannot be trusted.
+            shapeInvalid = true;
+            break;
+        }
+        // (c) A page must never exceed the requested per_page; a longer page is a
+        // malformed body, not extra coverage.
+        if (pageSecrets.length > PER_PAGE) {
+            shapeInvalid = true;
+            break;
+        }
+        // (a) Every entry must carry a string name that is a SYNTACTICALLY VALID
+        // GitHub Actions secret name — /^[A-Za-z_][A-Za-z0-9_]*$/ (letters, digits,
+        // underscores; not digit-leading; no spaces or other characters; never
+        // trimmed, so a name with surrounding whitespace is invalid, not
+        // whitespace-stripped-then-valid). (b) Names must be UNIQUE across the whole
+        // walk on their CANONICAL (uppercase) form, because GitHub secret names are
+        // case-insensitive — `Foo` and `FOO` are the same secret, so seeing both is a
+        // duplicate. A malformed entry ({}, empty/garbage/whitespace-filler name) or a
+        // canonical duplicate (e.g. the same 100-name page served twice) would
+        // otherwise pad the RAW count toward total_count while concealing an unseen —
+        // possibly prohibited — org secret. Any such entry fails closed, never
+        // empty=clean. The canonical form is also what Routine-secret matching runs on
+        // below, so a lowercase org copy (e.g. `project_ci_token`) is still detected.
+        let pageInvalid = false;
+        for (const s of pageSecrets) {
+            const raw = s && typeof s.name === "string" ? s.name : "";
+            if (!SECRET_NAME_SYNTAX.test(raw)) {
+                pageInvalid = true;
+                break;
+            }
+            const canonical = raw.toUpperCase();
+            if (orgNames.has(canonical)) {
+                pageInvalid = true;
+                break;
+            }
+            orgNames.add(canonical);
+        }
+        if (pageInvalid) {
+            shapeInvalid = true;
+            break;
+        }
+        // Every entry is now validated and unique, so accumulated counts only distinct
+        // real names (accumulated === orgNames.size). Matching runs on this set.
+        accumulated += pageSecrets.length;
+        // Stop only once the whole set is accounted for. A short page that still
+        // leaves accumulated < total_count is an inconsistent body, caught by the
+        // accumulated !== totalCount check after the loop.
+        if (accumulated >= totalCount)
+            break;
+        if (pageSecrets.length < PER_PAGE)
+            break;
+        if (page >= 1000) {
+            // Runaway guard: never spin forever on a pathological endpoint.
+            shapeInvalid = true;
+            break;
+        }
+    }
+    if (sawOkPage && orgStatus !== 200) {
+        // A 200 page was read, then a later request returned a non-200. Pagination
+        // began and was truncated mid-walk, so the listing is unprovable — this is
+        // unverifiable and fails closed regardless of owner type; the user-owned-repo
+        // n/a path is legal only on the FIRST request, before any 200 page.
+        violations.push({
+            check: "secret-scope-unverifiable",
+            message: `organization-scope secrets visible to ${nwo} could not be verified: a later page of the organization-secrets listing returned HTTP ${orgStatus} after an earlier page was read, so pagination was truncated and inspect cannot prove no org-level copy of ${ROUTINE_SECRETS.join(", ")} exists — failing closed; re-run inspect once the API returns a complete response, or confirm org-level secret absence with an organization admin`,
+        });
+    }
+    else if (orgStatus === 403) {
+        violations.push({
+            check: "secret-scope-unverifiable",
+            message: `organization-scope secrets visible to ${nwo} could not be verified (HTTP 403); do NOT widen the runtime CI token — instead verify org-level secret absence with a separate least-privileged credential (a fine-grained organization token granting organization "Secrets" read) or have an organization admin confirm no org-level copy of ${ROUTINE_SECRETS.join(", ")} is visible to the repository, then re-run inspect — failing closed`,
+        });
+    }
+    else if (orgStatus === 404) {
+        // A 404 means "no organization-secrets endpoint for this repository". That is
+        // legitimate ONLY for a user-owned repository. For an org-owned repo — or one
+        // whose owner type cannot be read — the endpoint should exist, so a 404 is
+        // itself unverifiable and fails closed.
+        const ownerType = await fetchOwnerType(ctx, nwo);
+        if (ownerType !== "User") {
+            const owner = ownerType === "Organization"
+                ? "is organization-owned"
+                : "has an owner type that could not be determined";
+            violations.push({
+                check: "secret-scope-unverifiable",
+                message: `organization-scope secrets for ${nwo} could not be verified: the repository ${owner} yet the organization-secrets endpoint returned 404, so inspect cannot prove no org-level copy of ${ROUTINE_SECRETS.join(", ")} exists — failing closed; verify org-level secret absence with a separate least-privileged credential (a fine-grained organization token granting organization "Secrets" read) or have an organization admin confirm, then re-run inspect`,
+            });
+        }
+        // ownerType === "User" => not owned by an org => org scope does not apply.
+    }
+    else if (orgStatus === 200) {
+        if (shapeInvalid || accumulated !== totalCount) {
+            const detail = shapeInvalid
+                ? "the organization-secrets response was malformed (a missing/non-integer/negative total_count, a non-array secrets field, a page longer than the per-page limit, or an entry whose name is missing, syntactically invalid, or a case-insensitive duplicate)"
+                : `the organization-secrets listing was incomplete (total_count ${totalCount} but ${accumulated} read)`;
+            violations.push({
+                check: "secret-scope-unverifiable",
+                message: `organization-scope secrets visible to ${nwo} could not be verified: ${detail}, so inspect cannot prove no org-level copy of ${ROUTINE_SECRETS.join(", ")} exists — failing closed; re-run inspect once the API returns a complete response, or confirm org-level secret absence with an organization admin`,
+            });
+        }
+        else {
+            for (const name of ROUTINE_SECRETS) {
+                if (orgNames.has(name.toUpperCase())) {
+                    violations.push({
+                        check: "org-scope-secret",
+                        message: `an organization-scope secret named ${name} is visible to ${nwo}; it resolves in the token-bearing job regardless of the environment and defeats the gate — remove the org-level copy (or revoke this repository's access to it) and store ${name} in the "${env}" environment only`,
+                    });
+                }
+            }
+        }
+    }
+    return violations;
+}
+/**
+ * Resolve a repository's owner type ("User" | "Organization" | "") via one GET
+ * /repos/{nwo}. Returns "" when the type cannot be read; callers treat an unknown
+ * owner type as fail-closed for organization-scope purposes.
+ */
+async function fetchOwnerType(ctx, nwo) {
+    const meta = await ctx.client.restProbe(`/repos/${nwo}`);
+    if (meta.status !== 200)
+        return "";
+    const json = (meta.json ?? {});
+    return json.owner && typeof json.owner.type === "string" ? json.owner.type : "";
+}
+/**
+ * Verify the default branch requires BOTH exact status-check contexts
+ * (`REQUIRED_STATUS_CHECK_CONTEXTS`) among its effective required status checks,
+ * reading effective branch protection AND branch rulesets and unioning their
+ * required contexts. Missing either context is a distinct violation; protection
+ * or rulesets that cannot be read (403, or an unknown default branch) is a
+ * distinct fail-closed "…-unreadable" violation. Only the token-bearing inspect
+ * path runs this; identity (secretless) never does.
+ */
+export async function checkBranchProtection(ctx, defaultBranch) {
+    const nwo = ctx.repo.nwo;
+    const violations = [];
+    const contexts = new Set();
+    if (defaultBranch.length === 0) {
+        violations.push({
+            check: "branch-protection-unreadable",
+            message: `the repository default branch could not be determined, so its required status checks cannot be verified — failing closed; ensure the token can read the repository`,
+        });
+        return { branch: defaultBranch, ok: false, requiredChecks: [], violations };
+    }
+    const branchPath = encodeURIComponent(defaultBranch);
+    // (1) Effective branch protection. Requires "Administration" read; a 403 means
+    // the scope is unverifiable and fails closed. A 404 is a definitive "no branch
+    // protection object" — readable, but contributing no contexts.
+    const protection = await ctx.client.restProbe(`/repos/${nwo}/branches/${branchPath}/protection`);
+    if (protection.status === 403) {
+        violations.push({
+            check: "branch-protection-unreadable",
+            message: `branch protection for "${defaultBranch}" could not be read (HTTP 403); grant the token repository "Administration" read so inspect can prove both required status checks (${REQUIRED_STATUS_CHECK_CONTEXTS.join(", ")}) are enforced — failing closed`,
+        });
+    }
+    else if (protection.status === 200) {
+        const pJson = (protection.json ?? {});
+        const rsc = pJson.required_status_checks ?? null;
+        if (rsc) {
+            for (const c of Array.isArray(rsc.contexts) ? rsc.contexts : []) {
+                if (typeof c === "string")
+                    contexts.add(c);
+            }
+            for (const c of Array.isArray(rsc.checks) ? rsc.checks : []) {
+                if (c && typeof c.context === "string")
+                    contexts.add(c.context);
+            }
+        }
+    }
+    // protection.status === 404 => branch not protected by a classic rule; a
+    // ruleset may still supply the contexts, so this is not itself unreadable.
+    // (2) Branch rulesets that apply to the default branch. Readable with plain
+    // repository read; a 403 still fails closed as a distinct unverifiable finding.
+    const rules = await ctx.client.restProbe(`/repos/${nwo}/rules/branches/${branchPath}`);
+    if (rules.status === 403) {
+        violations.push({
+            check: "branch-rulesets-unreadable",
+            message: `branch rulesets for "${defaultBranch}" could not be read (HTTP 403); grant the token repository read so inspect can prove both required status checks (${REQUIRED_STATUS_CHECK_CONTEXTS.join(", ")}) are enforced — failing closed`,
+        });
+    }
+    else if (rules.status === 200 && Array.isArray(rules.json)) {
+        for (const rule of rules.json) {
+            const r = (rule ?? {});
+            if (r.type !== "required_status_checks")
+                continue;
+            const checks = r.parameters?.required_status_checks;
+            for (const c of Array.isArray(checks) ? checks : []) {
+                if (c && typeof c.context === "string")
+                    contexts.add(c.context);
+            }
+        }
+    }
+    // rules.status === 404 => no rulesets apply => contributes no contexts.
+    // Require BOTH exact contexts among the unioned effective required checks.
+    for (const required of REQUIRED_STATUS_CHECK_CONTEXTS) {
+        if (!contexts.has(required)) {
+            violations.push({
+                check: "required-status-check-missing",
+                message: `the default branch "${defaultBranch}" does not require the status check "${required}"; add it to a branch protection rule or ruleset for "${defaultBranch}" so a pull request cannot merge without it — failing closed`,
+            });
+        }
+    }
+    return {
+        branch: defaultBranch,
+        ok: violations.length === 0,
+        requiredChecks: [...contexts].sort(),
+        violations,
+    };
+}
+// --------------------------------------------------------------------------
 // Command: inspect (read-only, fail-closed compliance)
 // --------------------------------------------------------------------------
 async function cmdInspect(ctx) {
-    await verifyAccess(ctx, false);
+    const access = await verifyAccess(ctx, false);
     const snapshot = await resolveProject(ctx.client, ctx.project);
     // Schema state.
     let schemaError = null;
@@ -1695,10 +2664,14 @@ async function cmdInspect(ctx) {
     for (const target of Object.keys(PAYLOADS)) {
         const abs = join(ctx.deps.cwd, target);
         const present = ctx.deps.fs.existsSync(abs);
-        const ok = present && ctx.deps.fs.readFileSync(abs).equals(decodePayload(target));
+        // The installation guide is the sole customizable installed artifact: it is
+        // verified present, never byte-identical. Every other payload stays exact.
+        const ok = target === CUSTOMIZABLE_INSTALL
+            ? present
+            : present && ctx.deps.fs.readFileSync(abs).equals(decodePayload(target));
         if (!ok)
             payloadFilesOk = false;
-        fileResults.push({ path: target, ok });
+        fileResults.push(target === CUSTOMIZABLE_INSTALL ? { path: target, ok, customizable: true } : { path: target, ok });
     }
     // Generated expectations bind the installed manager and static package. The
     // generated payload is the internal consistency root and must match the one
@@ -1759,6 +2732,13 @@ async function cmdInspect(ctx) {
         linkedByItem,
     });
     const repositoryLinked = await projectLinkedToRepo(ctx.client, ctx.project, ctx.repo.nwo);
+    // Secret-scoping environment posture. Only the token-bearing inspect path runs
+    // this; identity (secretless) never does. All violations are reported.
+    const environmentPosture = await checkEnvironmentPosture(ctx, access.defaultBranch);
+    // Default-branch required-status-check posture: both exact contexts must gate
+    // the default branch via branch protection and/or rulesets. Fails closed on any
+    // missing context or unreadable protection. Token-bearing inspect path only.
+    const branchProtection = await checkBranchProtection(ctx, access.defaultBranch);
     const openTrueUps = issues.filter((i) => trueUpNumber(i.title) !== null && i.state === "open");
     const nextTrueUp = openTrueUps[0] ?? null;
     const nextTrueUpItem = nextTrueUp
@@ -1779,7 +2759,9 @@ async function cmdInspect(ctx) {
         repositoryLinked &&
         itemsOk &&
         pullRequestsOk &&
-        nextTrueUpExists;
+        nextTrueUpExists &&
+        environmentPosture.ok &&
+        branchProtection.ok;
     return {
         command: "inspect",
         repo: ctx.repo.url,
@@ -1803,6 +2785,8 @@ async function cmdInspect(ctx) {
         repositoryLinked,
         itemsOk,
         nextTrueUpExists,
+        environmentPosture,
+        branchProtection,
         compliant,
     };
 }
@@ -1903,10 +2887,18 @@ async function planTrueUpBodyReplacement(ctx, lawBody) {
         throw new ManagerError("true-up-collision", "multiple open true-up issues exist");
     }
     const issue = open[0];
-    if (!issue || issue.body === lawBody)
-        return null;
-    const expected = `REPLACE-TRUE-UP-BODY:${issue.number}`;
     const confirmations = allOpts(ctx.opts, "replace-true-up-body");
+    if (!issue || issue.body === lawBody) {
+        // A replacement confirmation supplied when no stale true-up body exists
+        // authorizes nothing and would be silently ignored — fail closed instead.
+        if (confirmations.length > 0) {
+            throw new ManagerError("replace-true-up-body-mismatch", issue
+                ? `--replace-true-up-body was supplied but true-up #${issue.number} already carries the current law body; nothing to replace`
+                : "--replace-true-up-body was supplied but no open true-up issue exists; nothing to replace");
+        }
+        return null;
+    }
+    const expected = `REPLACE-TRUE-UP-BODY:${issue.number}`;
     if (confirmations.length !== 1 || confirmations[0] !== expected) {
         throw new ManagerError("replace-true-up-body-required", `stale true-up body requires --replace-true-up-body ${expected}`);
     }
@@ -1945,6 +2937,31 @@ async function trueUpBodyReplacementMatches(ctx, plan) {
         (issue.milestone?.title ?? null) === plan.milestone &&
         issue.body === plan.patch.body);
 }
+/**
+ * Freeze the fingerprint of a planning input. `bytes` are the exact bytes the
+ * plan consumed (null when the path was absent), so the recorded hash is the
+ * one the written content was derived from — not a re-read that could itself
+ * race.
+ */
+function freezePrewrite(into, label, abs, bytes) {
+    into.push({ label, abs, hash: bytes === null ? null : sha256Hex(bytes) });
+}
+/**
+ * Re-read every frozen source/target immediately before the first local write
+ * and return the first input whose existence or bytes drifted since planning
+ * (changed, disappeared, or appeared), or null when the whole transaction's
+ * inputs are unchanged. This closes the plan->apply TOCTOU window: a customized
+ * target edited after planning can no longer be silently overwritten by a stale
+ * merge, and a vendored source swapped after planning cannot be copied blindly.
+ */
+function firstDriftedPrewrite(fs, snapshots) {
+    for (const snap of snapshots) {
+        const current = fs.existsSync(snap.abs) ? sha256Hex(fs.readFileSync(snap.abs)) : null;
+        if (current !== snap.hash)
+            return snap.label;
+    }
+    return null;
+}
 async function cmdInstall(ctx) {
     const iteration = readIterationInputs(ctx.opts);
     const milestones = parseMilestoneInputs(allOpts(ctx.opts, "milestone"));
@@ -1968,12 +2985,46 @@ async function cmdInstall(ctx) {
     if (schemaPlan.createIteration && (!iteration.start || iteration.days === undefined)) {
         throw new ManagerError("iteration-inputs-required", "creating Iteration requires --iteration-start and --iteration-days");
     }
+    // Every planning input that determines a local write is fingerprinted from the
+    // exact bytes read here; the pre-write drift guard re-verifies them just before
+    // the first mutation so a plan->apply change fails closed with zero writes.
+    const prewrite = [];
     // Materialise the AGENTS content up front so malformed markers fail closed.
     const agentsPath = join(ctx.deps.cwd, "AGENTS.md");
-    const existingAgents = ctx.deps.fs.existsSync(agentsPath)
-        ? ctx.deps.fs.readFileSync(agentsPath).toString("utf8")
+    const agentsBytes = ctx.deps.fs.existsSync(agentsPath)
+        ? ctx.deps.fs.readFileSync(agentsPath)
         : null;
+    freezePrewrite(prewrite, "AGENTS.md", agentsPath, agentsBytes);
+    const existingAgents = agentsBytes === null ? null : decodeAgentsText(agentsBytes);
     const agentsContent = planAgentsContent(existingAgents, lawText);
+    // Resolve the customizable installation guide up front (read-only) so its
+    // exact plan appears in dry-run and an unsafe merge fails closed before any
+    // local or remote write.
+    const installGuide = resolveInstallCustomization(ctx.deps.fs, ctx.deps.cwd, decodePayload(CUSTOMIZABLE_INSTALL));
+    // Bind the resolved guide bytes to the exact target/base snapshots they were
+    // derived from: the merge result cannot outlive the inputs it merged. The
+    // target is always tracked (a null hash detects a guide that appears after an
+    // initial-install plan); the prior base is tracked only when it was consumed.
+    if (installGuide.ok) {
+        prewrite.push({
+            label: CUSTOMIZABLE_INSTALL,
+            abs: join(ctx.deps.cwd, CUSTOMIZABLE_INSTALL),
+            hash: installGuide.targetSha256,
+        });
+        if (installGuide.priorSourceSha256 !== null) {
+            // The merge base was recovered (digest-verified) from the installed payload
+            // artifact. Pin the EXACT bytes that derivation consumed — do NOT re-read
+            // the file here. A second read could differ from the bytes the base came
+            // from, letting a change slip past the guard while INSTALL content stays
+            // derived from the earlier read. Any later change to those bytes then fails
+            // closed at the guard.
+            prewrite.push({
+                label: RUNTIME_PAYLOAD,
+                abs: join(ctx.deps.cwd, RUNTIME_PAYLOAD),
+                hash: installGuide.priorSourceSha256,
+            });
+        }
+    }
     // Runtime siblings must exist to copy; absence is a hard failure.
     const selfManager = join(ctx.deps.selfDir, "manager.js");
     const selfPayload = join(ctx.deps.selfDir, "payload.generated.js");
@@ -1986,6 +3037,7 @@ async function cmdInstall(ctx) {
             repoPrivate: access.repoPrivate,
             files: filePlan,
             runtimeSiblingsPresent: ctx.deps.fs.existsSync(selfManager) && ctx.deps.fs.existsSync(selfPayload),
+            installGuide: publicInstallResolution(installGuide),
             milestones,
             remotePlan: {
                 link: true,
@@ -2001,6 +3053,18 @@ async function cmdInstall(ctx) {
     }
     if (!ctx.deps.fs.existsSync(selfManager) || !ctx.deps.fs.existsSync(selfPayload)) {
         throw new ManagerError("runtime-missing", "runtime siblings manager.js/payload.generated.js are absent; cannot vendor");
+    }
+    // An unsafe installation-guide merge fails closed before any local or remote
+    // write; the blocked reason is journaled and the run applies nothing.
+    if (!installGuide.ok) {
+        ctx.journal.record("blocked", `merge:${CUSTOMIZABLE_INSTALL}`, installGuide.reason);
+        return {
+            command: "install",
+            dryRun: false,
+            applied: false,
+            phase: "install-guide",
+            reason: installGuide.reason,
+        };
     }
     // A confirmed stale true-up body is repaired before install can write local
     // files or any unrelated remote resource.
@@ -2037,17 +3101,77 @@ async function cmdInstall(ctx) {
         },
     });
     for (const target of Object.keys(PAYLOADS)) {
-        localSteps.push(writeAndVerify(target, decodePayload(target)));
+        // The customizable installation guide is written from the resolved merge;
+        // every other payload is written byte-identically.
+        const data = target === CUSTOMIZABLE_INSTALL ? installGuide.content : decodePayload(target);
+        localSteps.push(writeAndVerify(target, data));
     }
-    localSteps.push(writeAndVerify(RUNTIME_MANAGER, ctx.deps.fs.readFileSync(selfManager)));
-    localSteps.push(writeAndVerify(RUNTIME_PAYLOAD, ctx.deps.fs.readFileSync(selfPayload)));
+    const managerBytes = ctx.deps.fs.readFileSync(selfManager);
+    // Bind the vendored runtime manager to the authoritative RUNTIME_MANAGER_SHA256
+    // identity (frozen at module load, the same generated/runtime identity chain the
+    // payload source is bound to) BEFORE it becomes the planned snapshot or is
+    // copied. A tampered or swapped manager.js — bytes that do not hash to the
+    // distribution's expectation — must never be vendored; the prewrite guard alone
+    // cannot catch it because it pins these very bytes. Fail closed before any local
+    // write, then pin the exact verified bytes into the pre-write snapshot.
+    if (sha256Hex(managerBytes) !== RUNTIME_MANAGER_SHA256) {
+        const reason = "runtime manager source bytes differ from the authoritative RUNTIME_MANAGER_SHA256 identity";
+        ctx.journal.record("blocked", `source-identity:${RUNTIME_MANAGER}`, reason);
+        return {
+            command: "install",
+            dryRun: false,
+            applied: false,
+            phase: "source-identity",
+            reason,
+        };
+    }
+    freezePrewrite(prewrite, "source:manager.js", selfManager, managerBytes);
+    localSteps.push(writeAndVerify(RUNTIME_MANAGER, managerBytes));
+    const payloadBytes = ctx.deps.fs.readFileSync(selfPayload);
+    // Bind this single read of the vendored payload source to the payload identity
+    // imported at module load BEFORE it becomes the planned snapshot. A source
+    // whose payload set diverges from the imported PAYLOADS (e.g. swapped between
+    // module import/merge planning and this read) must never be accepted and
+    // copied while INSTALL and the other payload files stay derived from the
+    // imported bytes; the prewrite guard alone cannot catch a change that precedes
+    // this read because it pins these very bytes. Fail closed before any local write.
+    const sourceIdentity = verifyRuntimePayloadSourceIdentity(payloadBytes);
+    if (!sourceIdentity.ok) {
+        ctx.journal.record("blocked", `source-identity:${RUNTIME_PAYLOAD}`, sourceIdentity.reason);
+        return {
+            command: "install",
+            dryRun: false,
+            applied: false,
+            phase: "source-identity",
+            reason: sourceIdentity.reason,
+        };
+    }
+    freezePrewrite(prewrite, "source:payload.generated.js", selfPayload, payloadBytes);
+    localSteps.push(writeAndVerify(RUNTIME_PAYLOAD, payloadBytes));
     localSteps.push(writeAndVerify(RUNTIME_PACKAGE, NESTED_PACKAGE_JSON));
     localSteps.push(writeAndVerify("AGENTS.md", agentsContent));
     const gitignorePath = join(ctx.deps.cwd, ".gitignore");
-    const existingIgnore = ctx.deps.fs.existsSync(gitignorePath)
-        ? ctx.deps.fs.readFileSync(gitignorePath).toString("utf8")
+    const gitignoreBytes = ctx.deps.fs.existsSync(gitignorePath)
+        ? ctx.deps.fs.readFileSync(gitignorePath)
         : null;
+    freezePrewrite(prewrite, ".gitignore", gitignorePath, gitignoreBytes);
+    const existingIgnore = gitignoreBytes === null ? null : gitignoreBytes.toString("utf8");
     localSteps.push(writeAndVerify(".gitignore", planGitignore(existingIgnore)));
+    // Root-cause TOCTOU guard: immediately before the first local mutation,
+    // re-read every planned source/target and fail closed if any changed,
+    // disappeared, or appeared since planning. Drift is journaled and blocks the
+    // entire local apply — no partial or stale-merge write can occur.
+    const drifted = firstDriftedPrewrite(ctx.deps.fs, prewrite);
+    if (drifted) {
+        ctx.journal.record("blocked", `local-drift:${drifted}`, "planned input changed between plan and apply");
+        return {
+            command: "install",
+            dryRun: false,
+            applied: false,
+            phase: "local-drift",
+            drift: drifted,
+        };
+    }
     ctx.journal.record("planned", "install", JSON.stringify(filePlan.map((f) => f.path)));
     const localResult = await runOrderedSteps(localSteps, ctx.journal);
     if (!localResult.ok) {
@@ -2233,8 +3357,14 @@ async function cmdMilestone(ctx) {
 async function cmdItem(ctx) {
     const issueOpt = nullableOpt(ctx.opts, "issue");
     const title = nullableOpt(ctx.opts, "title");
-    const confirm = nullableOpt(ctx.opts, "confirm");
-    const reset = nullableOpt(ctx.opts, "reset");
+    const confirm = singleOpt(ctx.opts, "confirm");
+    const reset = singleOpt(ctx.opts, "reset");
+    // --confirm and --reset each authorize a different single mutation; paired in
+    // one invocation one of them would be silently discarded, so the combination
+    // is contradictory and fails closed.
+    if (confirm !== null && reset !== null) {
+        throw new ManagerError("confirmation", "--confirm and --reset are mutually exclusive in one invocation");
+    }
     const status = nullableOpt(ctx.opts, "status");
     refuseApproved(status);
     if (!issueOpt && !title) {
@@ -2258,16 +3388,68 @@ async function cmdItem(ctx) {
     const snapshot = await resolveProject(ctx.client, ctx.project);
     const schemaPlan = planSchema(snapshot.fields);
     const issueNumberOpt = issueOpt ? parsePositiveInt(issueOpt, "issue") : null;
+    // On the title path, read the issue inventory once: the exact-title reconcile
+    // below and the duplicate-issue guard both consume it.
+    const issueInventory = issueNumberOpt === null ? await listIssues(ctx) : null;
     const existingIssue = issueNumberOpt !== null
         ? await getIssue(ctx, issueNumberOpt)
-        : (await listIssues(ctx)).find((issue) => issue.title === title) ?? null;
+        : issueInventory.find((issue) => issue.title === title) ?? null;
     const existingItem = existingIssue
         ? await findProjectItem(ctx.client, ctx.project, existingIssue.number, ctx.repo.nwo)
         : null;
+    // Duplicate-issue guard — CREATE path only (--title, no --issue, and no exact
+    // open-or-closed-title reconcile matched above). Before minting a net-new issue
+    // for requested Work, require verified absence of a plausible existing OPEN
+    // issue via a deterministic normalized near-match; a plausible candidate must
+    // be extended, not duplicated. Fail closed listing the candidates unless this
+    // invocation carries the exact item-specific `--confirm NEW-ISSUE:<title>`
+    // (mirrors the ARCHIVE:N / REPLACE-TRUE-UP-BODY:N idioms). The law-mandated
+    // true-up sequence never reaches here — createTrueUpIssue owns its own
+    // creation — so numbered `Project Board true-up #N` titles are unaffected.
+    if (issueNumberOpt === null && existingIssue === null && title !== null) {
+        const openTitles = (issueInventory ?? [])
+            .filter((issue) => issue.state === "open")
+            .map((issue) => ({ number: issue.number, title: issue.title }));
+        const candidates = duplicateIssueCandidates(title, openTitles);
+        if (candidates.length > 0 && confirm !== `NEW-ISSUE:${title}`) {
+            const shown = candidates
+                .slice(0, 10)
+                .map((candidate) => `#${candidate.number} ${candidate.title}`)
+                .join("; ");
+            const more = candidates.length > 10 ? ` (+${candidates.length - 10} more)` : "";
+            throw new ManagerError("duplicate-candidates", `refusing to create a net-new issue "${title}": ${candidates.length} open issue(s) may already cover this Work — ${shown}${more}. Extend the matching issue (scope note, comment, or native relation), or if this Work is genuinely distinct re-run with --confirm NEW-ISSUE:${title}`);
+        }
+        // A NEW-ISSUE confirmation with no duplicate candidates overrides nothing
+        // and would be silently ignored — fail closed instead.
+        if (candidates.length === 0 && confirm !== null && confirm.startsWith("NEW-ISSUE:")) {
+            throw new ManagerError("confirmation", "NEW-ISSUE confirmation was supplied but no duplicate candidates exist; nothing to confirm — re-run without --confirm");
+        }
+    }
+    // A NEW-ISSUE confirmation outside the net-new create path — an --issue
+    // update, an exact-title reconcile hit, or a confirm string that differs from
+    // the proposed --title — is a mismatched confirmation and fails closed before
+    // any mutation; a confirmation is never silently ignored.
+    if (confirm !== null && confirm.startsWith("NEW-ISSUE:")) {
+        if (issueNumberOpt !== null) {
+            throw new ManagerError("confirmation", "NEW-ISSUE confirmation applies only to --title creation without --issue");
+        }
+        if (existingIssue !== null) {
+            throw new ManagerError("confirmation", `NEW-ISSUE confirmation is mismatched: "${title}" already exists as issue #${existingIssue.number}; extend it or retitle the Work`);
+        }
+        if (confirm !== `NEW-ISSUE:${title}`) {
+            throw new ManagerError("confirmation", "NEW-ISSUE confirmation must repeat the exact proposed --title byte-for-byte");
+        }
+    }
+    // A reset confirmation that authorizes nothing here (no Approved status being
+    // cleared) would be silently ignored — fail closed instead.
+    if (reset !== null &&
+        !(existingItem?.statusName === APPROVED && fields.status !== null && fields.status !== APPROVED)) {
+        throw new ManagerError("confirmation", "--reset was supplied but this invocation clears no Approved status; nothing to reset");
+    }
     // Destructive Project-item actions need only an exact target and confirmation;
     // an incomplete item must still be archivable/deletable. Validate these before
     // the normal item's milestone/schema completeness preflight.
-    if (confirm !== null) {
+    if (confirm !== null && !confirm.startsWith("NEW-ISSUE:")) {
         const parsed = splitConfirmation(confirm);
         if (!parsed || (parsed.kind !== "ARCHIVE" && parsed.kind !== "DELETE")) {
             throw new ManagerError("confirmation", "expected --confirm ARCHIVE:N or DELETE:N");
@@ -2277,6 +3459,25 @@ async function cmdItem(ctx) {
             parsed.issue !== issueNumberOpt ||
             existingItem === null) {
             throw new ManagerError("confirmation", "confirmation must name an existing Project issue exactly");
+        }
+        // The destructive path performs exactly one action; any accompanying
+        // mutation option would be silently ignored — fail closed instead.
+        const extraneous = [
+            title !== null && "--title",
+            fields.status !== null && "--status",
+            fields.priority !== null && "--priority",
+            fields.size !== null && "--size",
+            fields.estimate !== null && "--estimate",
+            fields.iteration !== null && "--iteration",
+            parentNumber !== null && "--parent",
+            blockedBy.length > 0 && "--blocked-by",
+            labels.length > 0 && "--label",
+            assignees.length > 0 && "--assignee",
+            milestone !== null && "--milestone",
+            nullableOpt(ctx.opts, "body") !== null && "--body",
+        ].filter((flag) => typeof flag === "string");
+        if (extraneous.length > 0) {
+            throw new ManagerError("confirmation", `${parsed.kind}:${issueNumberOpt} is a single destructive action; these options would be silently ignored: ${extraneous.join(", ")}`);
         }
         if (ctx.dryRun) {
             return {
@@ -2591,7 +3792,7 @@ async function cmdStatus(ctx) {
     const issue = parsePositiveInt(requireOpt(ctx.opts, "issue"), "issue");
     const value = requireOpt(ctx.opts, "value");
     refuseApproved(value);
-    const reset = nullableOpt(ctx.opts, "reset");
+    const reset = singleOpt(ctx.opts, "reset");
     await verifyAccess(ctx, true);
     const snapshot = await resolveProject(ctx.client, ctx.project);
     const current = await findProjectItem(ctx.client, ctx.project, issue, ctx.repo.nwo);
@@ -2613,6 +3814,11 @@ async function cmdStatus(ctx) {
     // Clearing an observed Approved requires the exact reset confirmation.
     if (currentlyApproved && !(reset && parseConfirmation(reset, "RESET-APPROVAL", issue))) {
         throw new ManagerError("reset-approval-required", `clearing Approved requires --reset RESET-APPROVAL:${issue}`);
+    }
+    // A reset confirmation supplied when the item is not Approved authorizes
+    // nothing and would be silently ignored — fail closed instead.
+    if (reset !== null && !currentlyApproved) {
+        throw new ManagerError("confirmation", `--reset was supplied but issue #${issue} is not Approved; nothing to reset`);
     }
     if (ctx.dryRun) {
         return { command: "status", dryRun: true, plan };
@@ -2657,7 +3863,7 @@ async function cmdHr(ctx) {
         throw new ManagerError("bad-mode", "--mode must be decision or action");
     }
     const request = requireOpt(ctx.opts, "request");
-    const reset = nullableOpt(ctx.opts, "reset");
+    const reset = singleOpt(ctx.opts, "reset");
     await verifyAccess(ctx, true);
     const snapshot = await resolveProject(ctx.client, ctx.project);
     const current = await findProjectItem(ctx.client, ctx.project, issue, ctx.repo.nwo);
@@ -2672,6 +3878,11 @@ async function cmdHr(ctx) {
     // Moving to In Review would reset an observed Approved: require confirmation.
     if (approved && !(reset && parseConfirmation(reset, "RESET-APPROVAL", issue))) {
         throw new ManagerError("reset-approval-required", `moving an Approved item to In Review requires --reset RESET-APPROVAL:${issue}`);
+    }
+    // A reset confirmation supplied when the item is not Approved authorizes
+    // nothing and would be silently ignored — fail closed instead.
+    if (reset !== null && !approved) {
+        throw new ManagerError("confirmation", `--reset was supplied but issue #${issue} is not Approved; nothing to reset`);
     }
     if (ctx.dryRun) {
         return { command: "hr", dryRun: true, plan };
@@ -2924,6 +4135,11 @@ export async function main(argv, overrides) {
         }
         if (!isCommand(parsed.command)) {
             throw new ManagerError("bad-command", `unknown command: ${parsed.command}`);
+        }
+        for (const key of Object.keys(parsed.opts)) {
+            if (!GLOBAL_OPTIONS.has(key) && !COMMAND_OPTIONS[parsed.command].has(key)) {
+                throw new ManagerError("unknown-option", `--${key} is not an option of ${parsed.command}; a supplied option is never silently ignored`);
+            }
         }
         const ctx = buildContext(parsed, deps);
         token = ctx.token;

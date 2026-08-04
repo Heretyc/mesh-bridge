@@ -58,7 +58,9 @@ no version alias: its printed SHA-256 is its only identity.
 - A user OAuth token or classic PAT with `project` and repository issue scope. For a
   private repository use `repo`; for public-only repositories `public_repo` is enough.
   The same scopes cover user-owned and organization-owned Projects; for an organization
-  with SAML SSO, authorize the token for that organization.
+  with SAML SSO, authorize the token for that organization. An existing `gh` credential
+  that already carries these scopes is reused as-is; you do not generate a new token for
+  it.
 - `gh` for this setup recipe only. CI and manager runtime do not need it.
 
 GitHub's `GITHUB_TOKEN` has no user-Project permission and cannot replace
@@ -81,9 +83,9 @@ $Milestone = 'Project governance'
 $IterationStart = '2026-07-27'
 $IterationDays = '14'
 
-gh auth login --scopes 'repo,project'
-gh auth refresh -s repo -s project
-gh auth status
+gh auth status                          # scope check: reuse this token if it lists repo + project
+gh auth login --scopes 'repo,project'   # first-time login only; opens a browser
+gh auth refresh -s repo -s project      # only if repo/project are missing above; needs browser authorization
 $env:PROJECT_CI_TOKEN = gh auth token
 
 node $Manager install --repo $RepoUrl --project $ProjectUrl `
@@ -94,10 +96,15 @@ node $Manager install --repo $RepoUrl --project $ProjectUrl `
   --iteration-start $IterationStart --iteration-days $IterationDays
 
 # The token lives in a branch-restricted environment, never as a repository
-# secret; see "CI secret exposure" below for why this is required. Restrict the
+# secret; see "CI secret exposure" below for why this is required. The environment
+# is a secret-scoping gate, not a deployment: the workflow declares it with
+# `deployment: false`, which suppresses the Deployments-UI record (verified
+# 2026-08-03) while its branch policy stays fully enforced. Restrict the
 # environment to the DEFAULT BRANCH ONLY: schedule, push, dispatch, and the
 # base-controlled pull_request_target live-board job all run default-branch code.
 # Never admit `refs/pull/*/merge`; pull-request content must not reach the token.
+# Do not add a custom GitHub App deployment protection rule (incompatible with
+# `deployment: false`). `inspect` enforces this posture and fails if it drifts.
 $DefaultBranch = gh repo view $RepoSlug --json defaultBranchRef --jq '.defaultBranchRef.name'
 '{"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}' |
   gh api -X PUT "repos/$RepoSlug/environments/project-board-law" --input -
@@ -125,9 +132,9 @@ milestone='Project governance'
 iteration_start='2026-07-27'
 iteration_days='14'
 
-gh auth login --scopes 'repo,project'
-gh auth refresh -s repo -s project
-gh auth status
+gh auth status                          # scope check: reuse this token if it lists repo + project
+gh auth login --scopes 'repo,project'   # first-time login only; opens a browser
+gh auth refresh -s repo -s project      # only if repo/project are missing above; needs browser authorization
 export PROJECT_CI_TOKEN="$(gh auth token)"
 
 node "$manager" install --repo "$repo_url" --project "$project_url" \
@@ -138,10 +145,15 @@ node "$manager" install --repo "$repo_url" --project "$project_url" \
   --iteration-start "$iteration_start" --iteration-days "$iteration_days"
 
 # The token lives in a branch-restricted environment, never as a repository
-# secret; see "CI secret exposure" below for why this is required. Restrict the
+# secret; see "CI secret exposure" below for why this is required. The environment
+# is a secret-scoping gate, not a deployment: the workflow declares it with
+# `deployment: false`, which suppresses the Deployments-UI record (verified
+# 2026-08-03) while its branch policy stays fully enforced. Restrict the
 # environment to the DEFAULT BRANCH ONLY: schedule, push, dispatch, and the
 # base-controlled pull_request_target live-board job all run default-branch code.
 # Never admit refs/pull/*/merge; pull-request content must not reach the token.
+# Do not add a custom GitHub App deployment protection rule (incompatible with
+# `deployment: false`). `inspect` enforces this posture and fails if it drifts.
 default_branch="$(gh repo view "$repo_slug" --json defaultBranchRef --jq '.defaultBranchRef.name')"
 printf '%s' '{"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}' |
   gh api -X PUT "repos/$repo_slug/environments/project-board-law" --input -
@@ -173,9 +185,40 @@ body-only patch; apply fresh-checks the issue identity, `updated_at`, and body, 
 and verifies only that body, then continues installation. It does not change the title,
 state, milestone, comments, or Project status.
 
-To make the local token file, copy `.agents/project-ci.env.example` to
-`.agents/project-ci.env`, then place `PROJECT_CI_TOKEN=<token>` there. The installer adds
-that path to `.gitignore`; process environment takes precedence. Never commit the file.
+The manager runtime always requires `PROJECT_CI_TOKEN` in the process environment or, when
+unset there, in a gitignored `.agents/project-ci.env`; process environment takes
+precedence. You do not create a new token for this — reuse the credential `gh` already
+holds (the same value the wizard exported above). To persist it for later runs, upsert it
+straight from `gh auth token`. The token stays in memory, is never printed, and unrelated
+entries are preserved:
+
+PowerShell:
+
+```powershell
+$f = '.agents/project-ci.env'; $tmp = "$f.tmp"
+$tok = gh auth token
+$keep = if (Test-Path $f) { Get-Content $f | Where-Object { $_ -notmatch '^\s*PROJECT_CI_TOKEN=' } } else { @() }
+try {
+  Set-Content $tmp ($keep + "PROJECT_CI_TOKEN=$tok")
+  Move-Item -Force $tmp $f
+} finally {
+  Remove-Item $tmp -ErrorAction SilentlyContinue
+  Remove-Variable tok -ErrorAction SilentlyContinue
+}
+```
+
+POSIX shell:
+
+```sh
+f=.agents/project-ci.env
+tok=$(gh auth token)
+{ [ -f "$f" ] && grep -v '^[[:space:]]*PROJECT_CI_TOKEN=' "$f"; printf 'PROJECT_CI_TOKEN=%s\n' "$tok"; } > "$f.tmp" && mv "$f.tmp" "$f"
+unset tok
+```
+
+The installer adds `.agents/project-ci.env` to `.gitignore`; never commit it. Only if `gh`
+holds no credential with `project` and repository scope do you fall back to creating a
+classic PAT (see "Web-only or UI alternatives") and paste it into this file instead.
 
 ## New repository
 
@@ -236,6 +279,16 @@ Archive confirmation is `ARCHIVE:<issue-number>`, permanent Project-item deletio
 `DELETE:<issue-number>`, and clearing an approval is `RESET-APPROVAL:<issue-number>`.
 These confirmations are item-specific and cannot be supplied globally.
 
+Creating a net-new issue with `item --title` is guarded against duplicates. After the
+exact-title reconcile finds no match, the manager compares the proposed title against all
+open issue titles by a deterministic normalized near-match and fails closed with
+`duplicate-candidates` — listing the plausibly matching issues — so the Work extends an
+existing issue instead of forking a duplicate. Override only when the Work is genuinely
+distinct by adding the exact item-specific confirmation `--confirm NEW-ISSUE:<proposed
+title>` (the title must match byte-for-byte); an absent or mismatched confirmation fails
+before any mutation, and so does a confirmation supplied when no duplicate candidates
+exist. The law-mandated `Project Board true-up #N` sequence is exempt.
+
 ## Permissions, workflow, and adapters
 
 The installed workflow sets a default `permissions: contents: read`; only the
@@ -280,27 +333,67 @@ distinct paths would do so, and both are closed:
 - **Manual dispatch.** Running a workflow manually requires only write access, and the
   person triggering it chooses the ref, so `workflow_dispatch` from an attacker's branch
   would run that branch's manager with the token. Event conditions cannot prevent this.
-  Every token-bearing job therefore declares `environment: project-board-law`, because
+  Every token-bearing job therefore declares the `project-board-law` environment, because
   environment secrets reach only jobs using that environment and only after its
   protection rules pass.
 
-That second defense depends entirely on how the environment is configured, and it fails
+This environment is a **secret-scoping gate, not a deployment.** Each token-bearing job
+declares it as `environment: { name: project-board-law, deployment: false }`.
+`deployment: false` suppresses the Deployments-UI record GitHub would otherwise create for
+every environment run, so this governance never appears as a release in the Deployments
+timeline. Verified 2026-08-03: with `deployment: false` the environment's deployment
+**branch protection rules are still enforced** — a non-allowed ref fails with
+`Branch "…" is not allowed to deploy to project-board-law due to environment protection
+rules.` and receives **no** secret — and **zero** deployment objects are created. The
+environment therefore stays mandatory; it, not `deployment: false`, is the control.
+`inspect` audits this posture on every token-bearing run and fails closed if it drifts.
+
+That defense depends entirely on how the environment is configured, and it fails
 silently if it is wrong:
 
-1. Store `PROJECT_CI_TOKEN` **in the environment**, not as a repository secret. A
-   repository secret of the same name resolves in these jobs regardless of the
+1. Store every provisioned secret — `PROJECT_CI_TOKEN` and the two Routine-callback
+   secrets `CLAUDE_ROUTINE_FIRE_URL` and `CLAUDE_ROUTINE_FIRE_TOKEN` — **in the
+   environment**, never as a repository or organization secret. A copy of any of these
+   names at repository OR organization scope resolves in these jobs regardless of the
    environment and quietly removes the protection. The wizard above deletes any
-   repository-level copy for this reason.
+   repository-level copy for this reason. `inspect` sweeps every applicable scope —
+   repository secrets, and the organization secrets visible to the repository when it
+   belongs to an org — for each provisioned name and fails if any copy exists outside the
+   environment. The organization listing is paginated to completion and every page is
+   validated: each entry must carry a syntactically valid GitHub secret name (letters,
+   digits, and underscores, never starting with a digit — a blank, whitespace-padded, or
+   otherwise malformed filler name is rejected, not accepted), names must be unique across
+   the whole walk on a case-insensitive basis (GitHub secret names are case-insensitive, so
+   `Foo` and `FOO` are the same secret), no page may exceed the per-page limit, and
+   `total_count` must be a stable nonnegative integer. Routine-secret matching is likewise
+   case-insensitive, so a lower- or mixed-case org copy (for example `project_ci_token`) is
+   still caught. So a copy on a later page is never missed, and a malformed, duplicated, or
+   partial response fails closed rather than reading as clean. If a scope cannot be read (for
+   example the org-secrets API returns 403, or returns 404 for a repository whose owner is
+   an organization), `inspect` fails **closed** with a distinct `scope-unverifiable`
+   finding rather than silently passing. Grant the runtime token repository "Secrets" read
+   so the repository scope is provable. Do **not** widen the runtime CI token to
+   organization scope — its prerequisite is deliberately project + repository only (see
+   Prerequisites). Instead prove organization-secret absence out of band: with a separate
+   least-privileged credential (a fine-grained organization token granting organization
+   "Secrets" read) or by having an organization admin confirm no org-level copy exists,
+   then re-run `inspect`.
 2. Restrict the environment's deployment branches to the **default branch only**. That
    single policy is what rejects a dispatch from an arbitrary branch and binds the token
    to trusted code. Schedule, push, dispatch, and the `pull_request_target` `live-board`
    job all run default-branch code, so no other policy is needed. **Never** add
    `refs/pull/*/merge` or any pull-request ref: pull-request content must never claim the
-   environment or the token.
+   environment or the token. `inspect` fails unless exactly one custom branch policy
+   equal to the default branch exists, and it fails on any pull-ref policy.
 3. An environment that does not exist yet is created on first use **with no protection
    rules**, so a missing environment is an open door rather than a failure. Confirm it
-   exists under **Settings → Environments** before relying on it.
-4. Optionally add required reviewers to the environment so token-bearing runs also need a
+   exists under **Settings → Environments** before relying on it; `inspect` fails when the
+   environment is absent.
+4. **Do not add a custom GitHub App deployment protection rule.** Such rules are
+   incompatible with `deployment: false`: a job that declares it fails immediately when a
+   custom rule guards the environment. Use only the native branch policy above. `inspect`
+   fails if a custom deployment protection rule is present.
+5. Optionally add required reviewers to the environment so token-bearing runs also need a
    human approval, and enable **Prevent self-review**.
 
 Layer on as much of the following as your threat model warrants:
@@ -327,12 +420,76 @@ callback (Action → Routine). Do not configure the Routine to poll Actions. Giv
 Routine repository read access and let it call `hr`; retain human-only control of
 `Approved`.
 
+### Claude Routine callback bridge (opt-in)
+
+Claude automation is optional; Project Board Law also supports non-Claude installations,
+so the callback is disabled until you explicitly enable it. When enabled, the trusted
+`inspect` job (default-branch `push` or protected `workflow_dispatch` only — never a
+pull-request identity or pull-request content) posts a bounded, secret-free
+`project-board-law-inspection-callback/v1` summary to a Claude Routine API trigger. The
+summary carries only booleans, non-negative counts, and a capped list of noncompliant
+issue numbers; it never includes titles, bodies, URLs, target identifiers, tokens, or raw
+manager output.
+
+Configure it entirely with target-side settings; the vendored workflow embeds no endpoint
+or credential:
+
+1. Create or select a Claude Routine bound to this repository with the least repository and
+   connector permissions it needs, add an API trigger, and copy its URL and per-Routine
+   credential.
+2. Store both on the **existing `project-board-law` environment**, not as repository
+   secrets, so they inherit the same default-branch restriction as `PROJECT_CI_TOKEN`. A
+   repository secret of the same name resolves regardless of the environment and defeats
+   the control; delete any same-named repository-level copy.
+
+   ```sh
+   printf '%s' "$routine_url" | gh secret set CLAUDE_ROUTINE_FIRE_URL \
+     --repo "$repo_slug" --env project-board-law
+   printf '%s' "$routine_token" | gh secret set CLAUDE_ROUTINE_FIRE_TOKEN \
+     --repo "$repo_slug" --env project-board-law
+   gh secret delete CLAUDE_ROUTINE_FIRE_URL --repo "$repo_slug"    # only if one exists
+   gh secret delete CLAUDE_ROUTINE_FIRE_TOKEN --repo "$repo_slug"  # only if one exists
+   ```
+
+3. Only after both secrets exist and the environment's default-branch restriction is
+   verified, enable the bridge:
+
+   ```sh
+   gh variable set PROJECT_BOARD_CLAUDE_ROUTINE --repo "$repo_slug" --body 'true'
+   ```
+
+The callback URL must be HTTPS and must not embed credentials; the credential is a
+per-Routine trigger token, not an Anthropic API key. The `inspect` job sends a single POST
+with a 30-second timeout and **no retry** — the trigger has no idempotency key, so a retry
+could create a duplicate session; use GitHub's explicit re-run to recover. Rotate the two
+secrets like any credential; revoking the trigger is the kill switch.
+
+Failure modes are fail-closed and unambiguous:
+
+- **Disabled** (variable unset or not exactly `true`): a clear no-op. Claude automation is
+  simply not configured; it is not treated as an unavailable configured callback, and it is
+  never a third compliance status.
+- **Enabled** but a secret is missing or invalid, the endpoint rejects the request, the
+  transport fails, or the response is not the expected success shape: the trusted `inspect`
+  job fails. Routine availability, quota, paused state, credential rotation, and connector
+  permissions are target-side operational dependencies whose failure keeps that job failed
+  while the bridge is enabled.
+
+Dispatch success means only that a Routine session was created — not that the Routine
+completed, approved, or remediated anything. The bridge provides no Routine-to-GitHub
+completion callback and does not alter the exact two-check `Project Board Law / identity`
+plus `project-board-law/live-board` compliance definition. Because the Routine trigger is
+experimental (dated `anthropic-beta` header, pre-completion response, text-size cap), treat
+it as a versioned compatibility seam. If an independent Routine dispatcher already fires on
+the same Project Board event, remove or narrow it so it cannot create a second session.
+
 ## Web-only or UI alternatives
 
 The manager and `gh` automate every supported API step. These account-level actions may
 require GitHub web UI:
 
-1. Create a classic PAT: avatar → **Settings** → **Developer settings** → **Personal
+1. Create a classic PAT — fallback only when no existing `gh` credential carries `project`
+   plus repository scope: avatar → **Settings** → **Developer settings** → **Personal
    access tokens** → **Tokens (classic)** → **Generate new token (classic)** → select
    `repo` and `project` → **Generate token**. Copy it once into the local env file and the
    Actions secret; never paste it into an issue or log.
@@ -345,8 +502,13 @@ require GitHub web UI:
 4. Require both exact compliance checks: repository → **Settings** → **Branches**
    → add/edit protection rule → enable required status checks → require
    `Project Board Law / identity` and `project-board-law/live-board` → **Save changes**.
-   Full compliance is their conjunction. Remove the old `project-board-law/pre-merge`
-   requirement only after both replacements are active; it is migration-only.
+   Full compliance is their conjunction. A branch ruleset with the same two required
+   status checks works equally well. Remove the old `project-board-law/pre-merge`
+   requirement only after both replacements are active; it is migration-only. `inspect`
+   reads the default branch's effective branch protection **and** rulesets, unions their
+   required status checks, and fails **closed** if either exact context is missing or the
+   branch protection cannot be read (grant repository "Administration" read so it can be
+   verified).
 5. Human approval: open the governed Project → find the affected item → set `Status` to exact
    `Approved`. There is intentionally no manager command or secret that performs this.
 
@@ -397,6 +559,46 @@ Remote schema changes are additive and intentionally not auto-removed on rollbac
 Removing fields/options would be destructive; review them in Project settings and remove
 only with separate human authorization. Milestones likewise remain.
 
+## Customizing the installation guide
+
+`.agents/project-board-law/INSTALL.md` is the only installed artifact you may edit in a
+governed repository. Every other vendored file — the law, the compiled manager, the
+generated payload, the static package, the workflow, the adapters, and the configuration
+template — stays byte-identical to its embedded payload and is rejected on any drift.
+
+On upgrade the installer reconciles three versions of this guide with a deterministic,
+fail-closed line merge:
+
+- **base** — the prior vendored default, recovered as data from the already-installed
+  `.agents/project-board-law/payload.generated.js` only after that payload verifies
+  against its own manifest digest. The installer never imports or executes installed
+  bytes to obtain it.
+- **ours** — your on-disk customization.
+- **theirs** — the incoming vendored default.
+
+Identical or disjoint line edits merge automatically. An overlapping incompatible edit,
+an absent or unverifiable prior default, or an ambiguous newline or encoding fails closed
+before any file is written; the blocked reason is journaled and shown in the dry-run
+plan, and neither your customization nor an incoming security or functionality change is
+ever silently dropped. Resolve a blocked merge by hand, then rerun the dry-run and apply.
+Keep this file LF-encoded with a trailing newline; do not normalize it to CRLF. The
+dry-run plan reports the guide action as one of `initial`, `current`, `adopt-default`,
+`merged`, or a `blocked` reason, so the outcome is confirmable before applying.
+
+Because a customized guide is no longer byte-identical, record it as an owner-approved
+narrow exception in your own change-management notes, and keep that exception bounded by
+the two preconditions the merge depends on:
+
+1. **Committed-only runtime provenance.** The prior default is trusted only because the
+   installed runtime and generated payload are committed, review-gated bytes — never
+   pull-request content, artifacts, caches, or inputs. Require review on
+   `.agents/project-board-law/**` and `.github/workflows/**` so the runtime that supplies
+   the merge base cannot change unreviewed.
+2. **Hardened base-only `pull_request_target`.** The base-controlled governance job must
+   keep checking out only the immutable base commit and running inside the token-bearing
+   environment restricted to the default branch, so pull-request content never reaches the
+   token or defines the runtime. Never relax it to check out a pull-request ref.
+
 ## Troubleshooting
 
 - `missing PROJECT_CI_TOKEN`: export it or create `.agents/project-ci.env`.
@@ -419,3 +621,55 @@ only with separate human authorization. Milestones likewise remain.
   item-specific reset confirmation.
 - byte drift: restore canonical artifacts, then rerun the verified installer; do not
   normalize the managed block to CRLF.
+
+## Target-specific notes (owner-approved)
+
+These narrow exceptions are approved for this target and mirror the repository CI/CD
+SOP and PR template; they do not alter the vendored runtime bytes:
+
+- Committed-only runtime provenance: the `.agents/project-board-law/**` runtime is
+  tracked in source control; its printed SHA-256 is its only identity. That provenance
+  scope excludes this `INSTALL.md`, which is target-customizable and lives outside the
+  SHA'd payload byte-identity set. The `.gitignore` tracks that runtime and
+  `.agents/project-ci.env.example`, and ignores only `.agents/project-ci.env` and the
+  generated `.agents/project-board-law/journal.ndjson`.
+- Hardened `pull_request_target` precondition: the `live-board` job runs with a
+  read-only `contents: read` default and adds only job-scoped `statuses: write`; it
+  checks out only `github.event.pull_request.base.sha` with `persist-credentials: false`.
+  The broad PAT is never mapped outside the single manager inspection step, checkout runs
+  with no token in its environment, and PR-controlled fields are never interpolated into
+  shell commands, action inputs, env, cache/artifact inputs, or callback payloads. A PR
+  head SHA may be used only after `^[0-9a-f]{40}$` validation and only as the commit
+  status API target.
+- The `project-board-law` environment is a secret-scoping gate, not a deployment. The
+  workflow uses `environment: { name: project-board-law, deployment: false }`; verified
+  2026-08-03, this suppresses Deployments-UI records while branch policies remain
+  enforced. Do not add a custom GitHub App deployment protection rule, which is
+  incompatible with `deployment: false`; `inspect` must fail closed if this posture
+  drifts.
+- Conflict-safe local edits: if a governed file here diverges from a local edit during
+  install/upgrade, stop and ask the owner rather than overwrite the local change;
+  reconcile explicitly before re-running the installer.
+- Environment controls are mandatory fail-closed verification prerequisites, not asserted
+  facts. Before any token-bearing run, verify: the environment exists; exactly one
+  default-branch-only custom policy exists; no pull-ref policy exists; provisioned secrets
+  are stored in the environment; and no same-name repository or organization secret exists.
+- Least privilege: for read-only `inspect`, `PROJECT_CI_TOKEN` needs only `read:project`
+  unless a specific endpoint demonstrably requires repository read; private issue reads
+  need classic `repo`, while public issue reads need no repository scope. Write-capable
+  `project` plus `repo`/`public_repo` is only for authorized bootstrap/true-up writes and
+  must never be mapped into the read-only `live-board` job.
+- Multi-scope secret audit: every provisioned secret (`PROJECT_CI_TOKEN`,
+  `CLAUDE_ROUTINE_FIRE_URL`, and `CLAUDE_ROUTINE_FIRE_TOKEN`) belongs only in the
+  `project-board-law` environment, never at repository or organization scope. `inspect`
+  must fail closed if any applicable scope cannot be read, if org-secret pagination is
+  incomplete or malformed, or if a case-insensitive duplicate/copy is visible. Do not
+  widen the runtime CI token to organization scope; prove organization-secret absence
+  with a separate least-privileged org-secrets credential or an organization admin.
+- Duplicate-issue safety: before creating work, enumerate existing open issues and reuse
+  plausible fits. A new issue requires the exact item-specific
+  `--confirm NEW-ISSUE:<proposed title>` confirmation; the law-mandated true-up sequence
+  is the exception.
+- Action -> Routine callback: configured from the `PROJECT_BOARD_PROJECT_URL` repository
+  variable and the protected `project-board-law` environment secret only; no token or
+  trigger value is ever invented, printed, or committed.

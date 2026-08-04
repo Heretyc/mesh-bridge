@@ -16,9 +16,10 @@ Task:
    exists, preserve the report in the Claude session.
 
 Required checks:
-- Character limits: AGENTS.md must be <=12,000 bytes per `wc -c`; every other
-  repository Markdown/RAG file must be <=24,000 bytes per `wc -c`. The pre-flight
-  checker `node scripts/check-md-policy.mjs` must pass before any commit.
+- Character limits: every repository Markdown/RAG file, including AGENTS.md with
+  its byte-zero PROJECT-BOARD-LAW managed block, must be <=24,000 bytes per
+  `wc -c`. The pre-flight checker `node scripts/check-md-policy.mjs` must pass
+  before any commit.
 - JSON syntax: every JSON file must parse.
 - Python syntax: repository Python files used by CI or policy must compile
   without repo-local pycache.

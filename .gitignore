@@ -11,6 +11,7 @@ logs/
 *.xml
 *.wrapper.log
 *.lnk
-.agents/
+# Track the vendored Project Board Law runtime and env example; ignore only the
+# local secret env and the generated journal.
 .agents/project-ci.env
 .agents/project-board-law/journal.ndjson

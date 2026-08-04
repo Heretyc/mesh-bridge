@@ -23,8 +23,9 @@ Load Trigger. The only permitted exception is a tool-managed subagent-mcp
 managed block, which must be preserved verbatim when present.`;
 
 // One Load Trigger is registered in AGENTS.md for every non-AGENTS Markdown doc.
-// Keep this in sync with the AGENTS.md "Load Triggers" section.
-const EXPECTED_NON_AGENTS_MARKDOWN = 24;
+// Keep this in sync with the AGENTS.md "Load Triggers" section. The count includes
+// the vendored PROJECT-BOARD-LAW.md canonical law at the repository root.
+const EXPECTED_NON_AGENTS_MARKDOWN = 25;
 
 const root = process.cwd();
 const failures = [];
@@ -59,7 +60,9 @@ function checkFile(file) {
   if (isMarkdown) {
     markdownCount += 1;
     if (basename !== 'AGENTS.md') nonAgentsMarkdownCount += 1;
-    const limit = basename === 'AGENTS.md' ? 12000 : 24000;
+    // AGENTS.md carries the byte-zero PROJECT-BOARD-LAW managed block, so it
+    // shares the single 24000-byte cap applied to every governed .md doc.
+    const limit = 24000;
     if (buffer.length > limit) {
       failures.push(`FAIL ${rel(file)}: ${buffer.length} bytes exceeds ${limit} byte limit`);
     }

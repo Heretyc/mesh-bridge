@@ -153,3 +153,90 @@ Target SHA: <sha checked out for validation>
 - Limit routine environment variables, network access, connectors, and branch
   permissions to what the routine needs.
 - Remember that routines run autonomously without approval prompts during a run.
+
+## Project Board Law callback and exceptions (owner-approved)
+
+- **Action -> Routine callback.** Configure the Routine to receive the completed
+  Action inspection callback (Action completes -> Routine fires). Do not
+  configure the Routine to poll Actions. Wire it only from already-authorized,
+  available Routine configuration: the governed Project URL comes from the
+  `PROJECT_BOARD_PROJECT_URL` repository variable, and any bearer credential
+  lives only in the `project-board-law` protected environment secret. Never
+  invent, print, or commit a token or trigger value. Give the Routine repository
+  read access and let it call `hr`; retain human-only control of `Approved`.
+  Remove or narrow a duplicate dispatcher only if policy proves it required.
+- **Fail-closed verification prerequisites (mandatory, not asserted).** Before
+  any token-bearing run or callback is trusted, each control below must be
+  actively verified; if verification cannot be performed or fails, the run/config
+  is blocked (fail closed) and the token is treated as unprotected. Do not assert
+  these as facts:
+  1. The `project-board-law` **environment exists** (a missing environment is
+     created on first use with no protection rules — an open door, not a
+     failure).
+  2. `PROJECT_CI_TOKEN` is stored **in the environment**, and **no repository
+     secret of the same name exists** (a repo-level copy silently removes the
+     protection; delete it).
+  3. The environment's **deployment branches are restricted to the default
+     branch only**; confirm no `refs/pull/*/merge` or other branch policy is
+     present.
+  4. Optional but recommended: required reviewers and "Prevent self-review" are
+     enabled on the environment.
+  Record the verification outcome (pass/blocked) per run; never rely on
+  configuration being correct without checking it.
+- **Least privilege (concrete).** Credential type: a classic PAT (or dedicated
+  machine-account PAT) used **only** as `PROJECT_CI_TOKEN`. Minimum scope for the
+  read-only `inspect` use is `read:project` (read-only Projects access), **not**
+  the write-capable `project` scope. Grant **no** repository write scope for
+  inspection; add a repository scope only if a specific endpoint demonstrably
+  requires it, at the minimum documented scope — reading issues on a **private**
+  repository needs classic `repo` (the narrowest classic scope that reads private
+  issues), while public-repository issue reads need no repository scope.
+  `public_repo`/`repo` grant write and are not required for read-only inspection;
+  never an Anthropic API key. Permitted use: a single read-only manager `inspect`
+  execution step against the GitHub GraphQL/REST Projects and issues endpoints
+  for the one governed repository and Project — no write-capable subcommand (such
+  as `hr`) runs under this token in the read-only `live-board` job; the token is
+  mapped **solely** to that inspect step and any run that cannot honor that
+  mapping fails closed; not exposed to checkout, setup, artifact upload/download,
+  caches, or PR inputs. The callback/verdict `GITHUB_TOKEN` uses job-scoped
+  `statuses: write` (plus `pull-requests: read` only on the separate verdict
+  bridge, never on this `live-board` inspect job) and nothing more.
+- **Committed-only runtime provenance (exception).** The vendored
+  `.agents/project-board-law/**` runtime is tracked in source control rather than
+  fetched at run time; its printed SHA-256 is its only identity. The `.gitignore`
+  tracks that runtime and the env example while keeping `project-ci.env` and the
+  generated `journal.ndjson` ignored.
+- **Hardened `pull_request_target` precondition (exception).** The token-bearing
+  `live-board` job runs under `pull_request_target` and must satisfy every clause
+  below; any clause that cannot be met blocks the job (fail closed):
+  1. **Read-only checkout permission.** The workflow default is
+     `permissions: contents: read`; the `live-board` job adds only the job-scoped
+     `statuses: write` it needs to publish its status. It declares **no**
+     `pull-requests: read` (that permission is justified solely on the separate
+     verdict bridge, not here) and no other write permission.
+  2. **Exact base-SHA checkout, no credentials.** If it checks out at all, it
+     checks out only the immutable `github.event.pull_request.base.sha` with
+     `actions/checkout` set to `persist-credentials: false`. Because the job
+     declares `environment: project-board-law`, `PROJECT_CI_TOKEN` is in fact
+     available to the whole job, so the protection is **not** that the secret is
+     unavailable at checkout — it is that the broad token is never mapped into
+     `env:`, `with:`, or git config anywhere except the single manager inspection
+     step, and the checkout step runs with no token in its environment. It never
+     checks out the PR head, merge ref, `refs/pull/*/merge`, artifacts, caches,
+     or inputs.
+  3. **No PR-controlled fields reach code or the callback.** Attacker-controlled
+     `pull_request` fields — title, body, branch/head ref name, label names,
+     author/login, comments — must never be interpolated into shell commands,
+     into action `with:` parameters, into `env:`, or into any callback/verdict
+     payload. Pass only fixed literals and the vetted base SHA; treat all event
+     fields as untrusted data, never as expression or command input.
+     **Target-SHA exception.** The one PR-derived value the job may consume is the
+     head SHA used as the commit-status target, and only after it is validated
+     against `^[0-9a-f]{40}$`. Even then it is allowed solely as the status API
+     target argument — never as shell text, an action input, `env:` data, a
+     cache/artifact key or input, or callback content.
+  4. **Single token step, fixed status.** `PROJECT_CI_TOKEN` is exposed to one
+     `inspect` step from the default-branch-restricted `project-board-law`
+     environment, and the job publishes only the fixed
+     `project-board-law/live-board` status via a job-scoped `statuses: write`
+     `GITHUB_TOKEN` — never the PAT.

@@ -28,6 +28,11 @@ the block is preserved. A malformed or duplicate block is a hard failure. Build,
 install, inspect, reconcile, and CI checks must reject drift among the canonical file,
 the manager's embedded payload, and the installed block.
 
+The vendored installation guide `.agents/project-board-law/INSTALL.md` is the sole
+installed artifact a governed repository may customize. The manager updates it by a
+deterministic, fail-closed three-way merge and never by executing installed target code;
+every other vendored artifact stays byte-identical to its embedded payload.
+
 ## 2. Manager authority and addressing
 
 The vendored Node.js 24 LTS manager is the sole automation entry point. It is a
@@ -56,8 +61,17 @@ The token key is `PROJECT_CI_TOKEN`. Process environment wins over
 gitignored and its tracked example contains no secret. In GitHub Actions the token is an
 environment secret bound to the `project-board-law` environment whose deployment branch
 policy is the default branch only, so it reaches only trusted default-branch execution;
-pull-request content never receives this broadly-scoped PAT. Tokens, authorization
-headers, and secret-bearing values are never printed or journaled.
+pull-request content never receives this broadly-scoped PAT. That environment is a
+secret-scoping gate, not a deployment: each token-bearing job declares it with
+`deployment: false`, which suppresses the Deployments-UI record (verified 2026-08-03)
+while leaving the environment's branch protection rules fully enforced. The environment
+remains mandatory — it, not `deployment: false`, keeps the token off untrusted refs — and
+`inspect` enforces its posture (environment present, one default-branch-only custom policy,
+no pull-ref policy, no custom GitHub App deployment protection rule — incompatible with
+`deployment: false` — and no copy of any provisioned secret (`PROJECT_CI_TOKEN`,
+`CLAUDE_ROUTINE_FIRE_URL`, `CLAUDE_ROUTINE_FIRE_TOKEN`) at repository or organization scope,
+failing closed on any scope it cannot read). Tokens,
+authorization headers, and secret-bearing values are never printed or journaled.
 
 Use a user OAuth token or classic personal access token whose account can reach the
 governed Project, whether that Project is user-owned or organization-owned. Read-only
@@ -71,6 +85,14 @@ access before planning mutations; unverifiable or insufficient scopes fail close
 Work is a mutation of git-tracked repository content. Every unit of Work maps to a
 repository issue in the Project, and every pull request maps to a Project issue. Project
 draft issues do not satisfy this rule.
+
+Before creating any issue for requested Work, an agent must enumerate the existing open
+issues and evaluate each for plausible fit against that Work. A plausible fit means the
+Work extends an existing issue — recorded as a scope note, comment, or native relation —
+and must never become a net-new issue. Ambiguity among two or more candidates requires a
+Decision HR listing the candidates. Creation is permitted only on verified absence of any
+plausible fit. A mid-task scope change or human redirection re-triggers this evaluation
+before any new issue. Wording-level title differences are not evidence of net-new Work.
 
 The manager additively ensures this custom schema:
 
@@ -122,6 +144,17 @@ only then releases local installation and unrelated remote steps. The replacemen
 ordered and journaled but not atomic with later install mutations; any concurrent or
 unverifiable state fails closed.
 
+Install writes the vendored installation guide `.agents/project-board-law/INSTALL.md` by
+a deterministic line-based three-way merge of the prior upstream default, the current
+target customization, and the incoming default. The prior default is read as data from
+the already-installed generated payload after that payload verifies against its own
+manifest digest; installed target code is never imported or executed. Identical or
+disjoint line edits merge deterministically; an overlapping incompatible edit, an absent
+or unverifiable prior default, or ambiguous newline or encoding fails closed before any
+write and is journaled and planned, dropping neither the customization nor an incoming
+security or functionality change. Initial install writes the incoming default. Every
+other installed artifact is written byte-identically and re-verified.
+
 ## 6. Status and Human Review
 
 Status values are case-sensitive. Humans alone set `Approved`; the manager must reject
@@ -166,22 +199,27 @@ true-up with the exact law body. The manager does not set `Approved` itself.
 The generic GitHub Actions workflow runs on Node.js 24, uses direct API access, and does
 not install or require `gh`. Its default continuous check is read-only. A `pull_request`
 event runs the token-free `Project Board Law / identity` check on pull-request content.
-It verifies every embedded payload against its installed bytes, the installed compiled
-manager against its generated SHA-256, the static runtime package against its generated
-bytes, and the root `AGENTS.md` block. This is deterministic internal consistency, not an
+It verifies every embedded payload except the customizable installation guide against its
+installed bytes — the installation guide is verified present, not byte-identical — the
+installed compiled manager against its generated SHA-256, the static runtime package
+against its generated bytes, and the root `AGENTS.md` block. This is deterministic internal consistency, not an
 external trust root: coordinated replacement of the workflow and every embedded
 expectation can agree with itself and still requires review.
 
 A separate base-controlled `pull_request_target` job checks out the immutable base commit
 — never pull-request content, artifacts, caches, or inputs — inside the
-`project-board-law` environment; it alone holds `statuses: write` and uses it solely to
+`project-board-law` environment (declared `deployment: false`, a secret-scoping gate that
+records no deployment yet still enforces its branch policy); it alone holds
+`statuses: write` and uses it solely to
 publish the fixed `project-board-law/live-board` status check, never a broad token to
 pull-request content. The exact required checks are `Project Board Law / identity` and
 `project-board-law/live-board`; full compliance is their conjunction. The former
 `project-board-law/pre-merge` context is migration-only and is not compliance evidence.
 Because any account that can push a branch can also post a commit status through the
 portable API, the live-board status is advisory against a determined insider and must be
-paired with branch protection and review. Live smoke is explicitly opt-in and read-only.
+paired with branch protection and review; `inspect` verifies the default branch's effective
+branch protection and rulesets require both exact contexts and fails closed if either is
+missing or the protection is unreadable. Live smoke is explicitly opt-in and read-only.
 Every `PROJECT_CI_TOKEN` reference in inspect, true-up, and live-smoke workflows is scoped
 only to the manager execution step; checkout, setup, and artifact-upload steps never
 receive it. Scheduled or manually authorized write jobs upload the journal and retain
