@@ -2370,6 +2370,25 @@ export async function auditSecretScopes(ctx, env) {
         // 404 => absent at repository scope => compliant for this name.
     }
     // Organization scope: the org secrets shared with (visible to) this repository.
+    // Whether the scope APPLIES is decided by the repository's OWNER TYPE, never by
+    // the endpoint's status code — live GitHub answers the organization-secrets
+    // endpoint inconsistently for user-owned repositories (404 and 422 both
+    // observed), so probing first and interpreting the failure is unsound. Owner
+    // type "User" legitimately has no organization scope; "Organization" must
+    // paginate the listing to completion; an unreadable owner type is unverifiable.
+    const ownerType = await fetchOwnerType(ctx, nwo);
+    if (ownerType !== "User" && ownerType !== "Organization") {
+        violations.push({
+            check: "secret-scope-unverifiable",
+            message: `organization-scope secrets for ${nwo} could not be verified: the repository owner type could not be read, so inspect cannot prove no org-level copy of ${ROUTINE_SECRETS.join(", ")} exists — failing closed; ensure the token can read the repository, then re-run inspect`,
+        });
+        return violations;
+    }
+    if (ownerType === "User") {
+        // Not owned by an organization — org scope does not apply, and the
+        // organization-secrets endpoint is never probed.
+        return violations;
+    }
     // Paginate to completion and validate the response shape. A Routine secret on
     // ANY page defeats the gate even if repository scope is clean, so a single
     // unpaginated read could silently miss a copy on page 2+; a malformed or partial
@@ -2380,11 +2399,8 @@ export async function auditSecretScopes(ctx, env) {
     let totalCount = 0;
     let accumulated = 0;
     let shapeInvalid = false;
-    // A non-200 is a legitimate "org scope does not apply" signal ONLY on the very
-    // first request, before any page has been read. Once a 200 page has been
-    // collected, pagination is underway; a later non-200 truncates the listing and
-    // we can no longer prove completeness, so it is unverifiable, NOT the
-    // user-owned-repo n/a case. Track whether a 200 page has been seen.
+    // Once a 200 page has been collected, pagination is underway; a later non-200
+    // truncates the listing and completeness can no longer be proven.
     let sawOkPage = false;
     for (let page = 1;; page += 1) {
         const orgProbe = await ctx.client.restProbe(`/repos/${nwo}/actions/organization-secrets?per_page=${PER_PAGE}&page=${page}`);
@@ -2467,40 +2483,22 @@ export async function auditSecretScopes(ctx, env) {
             break;
         }
     }
-    if (sawOkPage && orgStatus !== 200) {
-        // A 200 page was read, then a later request returned a non-200. Pagination
-        // began and was truncated mid-walk, so the listing is unprovable — this is
-        // unverifiable and fails closed regardless of owner type; the user-owned-repo
-        // n/a path is legal only on the FIRST request, before any 200 page.
+    if (orgStatus !== 200) {
+        // Any non-200 on an organization-owned repository is unverifiable: either
+        // pagination was truncated mid-walk, access is denied, or the endpoint
+        // answered anomalously. There is no n/a interpretation here — owner type
+        // already established that org scope applies.
+        const how = sawOkPage
+            ? `a later page of the organization-secrets listing returned HTTP ${orgStatus} after an earlier page was read, so pagination was truncated`
+            : orgStatus === 403
+                ? `the organization-secrets listing returned HTTP 403; do NOT widen the runtime CI token — instead verify org-level secret absence with a separate least-privileged credential (a fine-grained organization token granting organization "Secrets" read) or have an organization admin confirm`
+                : `the organization-secrets listing returned HTTP ${orgStatus} for an organization-owned repository`;
         violations.push({
             check: "secret-scope-unverifiable",
-            message: `organization-scope secrets visible to ${nwo} could not be verified: a later page of the organization-secrets listing returned HTTP ${orgStatus} after an earlier page was read, so pagination was truncated and inspect cannot prove no org-level copy of ${ROUTINE_SECRETS.join(", ")} exists — failing closed; re-run inspect once the API returns a complete response, or confirm org-level secret absence with an organization admin`,
+            message: `organization-scope secrets visible to ${nwo} could not be verified: ${how}, so inspect cannot prove no org-level copy of ${ROUTINE_SECRETS.join(", ")} exists — failing closed`,
         });
     }
-    else if (orgStatus === 403) {
-        violations.push({
-            check: "secret-scope-unverifiable",
-            message: `organization-scope secrets visible to ${nwo} could not be verified (HTTP 403); do NOT widen the runtime CI token — instead verify org-level secret absence with a separate least-privileged credential (a fine-grained organization token granting organization "Secrets" read) or have an organization admin confirm no org-level copy of ${ROUTINE_SECRETS.join(", ")} is visible to the repository, then re-run inspect — failing closed`,
-        });
-    }
-    else if (orgStatus === 404) {
-        // A 404 means "no organization-secrets endpoint for this repository". That is
-        // legitimate ONLY for a user-owned repository. For an org-owned repo — or one
-        // whose owner type cannot be read — the endpoint should exist, so a 404 is
-        // itself unverifiable and fails closed.
-        const ownerType = await fetchOwnerType(ctx, nwo);
-        if (ownerType !== "User") {
-            const owner = ownerType === "Organization"
-                ? "is organization-owned"
-                : "has an owner type that could not be determined";
-            violations.push({
-                check: "secret-scope-unverifiable",
-                message: `organization-scope secrets for ${nwo} could not be verified: the repository ${owner} yet the organization-secrets endpoint returned 404, so inspect cannot prove no org-level copy of ${ROUTINE_SECRETS.join(", ")} exists — failing closed; verify org-level secret absence with a separate least-privileged credential (a fine-grained organization token granting organization "Secrets" read) or have an organization admin confirm, then re-run inspect`,
-            });
-        }
-        // ownerType === "User" => not owned by an org => org scope does not apply.
-    }
-    else if (orgStatus === 200) {
+    else {
         if (shapeInvalid || accumulated !== totalCount) {
             const detail = shapeInvalid
                 ? "the organization-secrets response was malformed (a missing/non-integer/negative total_count, a non-array secrets field, a page longer than the per-page limit, or an entry whose name is missing, syntactically invalid, or a case-insensitive duplicate)"
@@ -2525,8 +2523,9 @@ export async function auditSecretScopes(ctx, env) {
 }
 /**
  * Resolve a repository's owner type ("User" | "Organization" | "") via one GET
- * /repos/{nwo}. Returns "" when the type cannot be read; callers treat an unknown
- * owner type as fail-closed for organization-scope purposes.
+ * /repos/{nwo}, consulted BEFORE any organization-secrets probe: the owner type,
+ * not a status code, decides whether org scope applies. Returns "" when the type
+ * cannot be read; callers treat an unknown owner type as fail-closed.
  */
 async function fetchOwnerType(ctx, nwo) {
     const meta = await ctx.client.restProbe(`/repos/${nwo}`);

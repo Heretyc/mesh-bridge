@@ -359,7 +359,11 @@ silently if it is wrong:
    repository-level copy for this reason. `inspect` sweeps every applicable scope —
    repository secrets, and the organization secrets visible to the repository when it
    belongs to an org — for each provisioned name and fails if any copy exists outside the
-   environment. The organization listing is paginated to completion and every page is
+   environment. The repository's owner type, read first, decides whether organization
+   scope applies: a user-owned repository is never probed at the org-secrets endpoint
+   (live GitHub answers it inconsistently for user-owned repositories), an
+   organization-owned repository must yield a complete listing, and an unreadable owner
+   type fails closed. The organization listing is paginated to completion and every page is
    validated: each entry must carry a syntactically valid GitHub secret name (letters,
    digits, and underscores, never starting with a digit — a blank, whitespace-padded, or
    otherwise malformed filler name is rejected, not accepted), names must be unique across
