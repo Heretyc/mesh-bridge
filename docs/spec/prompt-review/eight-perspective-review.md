@@ -94,20 +94,26 @@ Do not mark review complete by majority vote.
 
 ## Review Record Template
 
+Each perspective line records its verdict **and** the evidence/justification for
+that verdict, so a `pass` is traceable, not asserted. Record either one reviewer
+id + date per perspective, or a single `Consolidated by` id + date when one
+reviewer ran all eight passes.
+
 ```markdown
 ## Review Record: <file>
 
 - File:
 - Review date:
+- Reviewer id(s) / Consolidated by:
 - Scope:
-- Clarity reviewer: pass|concern
-- Role and context reviewer: pass|concern
-- Structure reviewer: pass|concern
-- Example reviewer: pass|concern
-- Negative-constraint reviewer: pass|concern
-- Reasoning and decomposition reviewer: pass|concern
-- Output-format reviewer: pass|concern
-- Iteration and adversarial reviewer: pass|concern
+- Clarity reviewer: pass|concern — evidence: <what was checked and why it passes/concerns>
+- Role and context reviewer: pass|concern — evidence: <...>
+- Structure reviewer: pass|concern — evidence: <...>
+- Example reviewer: pass|concern — evidence: <...>
+- Negative-constraint reviewer: pass|concern — evidence: <...>
+- Reasoning and decomposition reviewer: pass|concern — evidence: <...>
+- Output-format reviewer: pass|concern — evidence: <...>
+- Iteration and adversarial reviewer: pass|concern — evidence: <...>
 - Concerns:
 - Revisions made:
 - Consensus: pass|blocked
