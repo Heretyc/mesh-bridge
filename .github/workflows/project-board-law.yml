@@ -100,7 +100,7 @@ jobs:
       # No secret is needed here, but the checkout runs before PR-controlled
       # JavaScript executes below. Drop the persisted GITHUB_TOKEN from .git/config
       # so author-controlled code can never read it. Keeps this job token-free.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -184,7 +184,7 @@ jobs:
       # Immutable base commit only. Never the pull request head, its artifacts,
       # caches, or inputs: privileged code must not execute author-controlled bytes.
       - name: Checkout the immutable base commit
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           persist-credentials: false
@@ -324,7 +324,7 @@ jobs:
       # https://github.com/orgs/OWNER/projects/NUMBER
       PROJECT_BOARD_PROJECT_URL: ${{ vars.PROJECT_BOARD_PROJECT_URL }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
@@ -568,7 +568,7 @@ jobs:
       PROJECT_BOARD_PROJECT_URL: ${{ vars.PROJECT_BOARD_PROJECT_URL }}
       TRUE_UP_MILESTONE: ${{ github.event_name == 'workflow_dispatch' && inputs.milestone || vars.PROJECT_BOARD_TRUE_UP_MILESTONE }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
